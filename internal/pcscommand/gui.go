@@ -40,15 +40,24 @@ type GuiSession struct {
 	// quit is closed when the page asks the server to stop.
 	quit chan struct{}
 
-	mu     sync.Mutex
-	workMu sync.Mutex
-	log    []string
-	plan   *reconcile.Plan
-	report *reconcile.PlanReport
+	mu              sync.Mutex
+	workMu          sync.Mutex
+	log             []string
+	plan            *reconcile.Plan
+	report          *reconcile.PlanReport
+	progress        guiProgress
+	lastProgressLog time.Time
+}
+
+type guiProgress struct {
+	reconcile.Progress
+	Running   bool   `json:"running"`
+	Status    string `json:"status"`
+	StartedAt int64  `json:"startedAt"`
 }
 
 // guiVersion identifies the front-end in reports and in the page footer.
-const guiVersion = "0.2.0"
+const guiVersion = "0.4.1"
 
 // RunReconcileGui starts the local interface and blocks until the process is
 // interrupted or the page asks it to shut down.
@@ -168,6 +177,21 @@ func (s *GuiSession) operation(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		defer s.workMu.Unlock()
+		tracked := r.URL.Path == "/api/plan" || r.URL.Path == "/api/probe" || r.URL.Path == "/api/apply"
+		if tracked {
+			s.mu.Lock()
+			s.progress = guiProgress{Running: true, Status: "running", StartedAt: time.Now().UnixMilli(), Progress: reconcile.Progress{Phase: "starting"}}
+			s.lastProgressLog = time.Time{}
+			s.mu.Unlock()
+			defer func() {
+				s.mu.Lock()
+				s.progress.Running = false
+				if s.progress.Status == "running" {
+					s.progress.Status = "complete"
+				}
+				s.mu.Unlock()
+			}()
+		}
 		next(w, r)
 	}
 }
@@ -203,24 +227,60 @@ func (s *GuiSession) writeJSON(w http.ResponseWriter, payload interface{}) {
 }
 
 func (s *GuiSession) fail(w http.ResponseWriter, err error) {
+	s.mu.Lock()
+	s.progress.Status = "error"
+	s.mu.Unlock()
 	s.appendLog("错误: " + err.Error())
 	s.writeJSON(w, map[string]interface{}{"ok": false, "error": err.Error()})
 }
 
 func (s *GuiSession) handleState(w http.ResponseWriter, r *http.Request) {
-	sess := &ReconcileSession{Observer: s.appendLog}
+	sess := &ReconcileSession{Observer: s.appendLog, Progress: s.observeProgress}
+	s.mu.Lock()
+	pending := s.report
+	if s.plan == nil {
+		pending = nil
+	}
+	s.mu.Unlock()
 	s.writeJSON(w, map[string]interface{}{
-		"ok":      true,
-		"version": guiVersion,
-		"account": sess.Account(),
+		"ok":          true,
+		"version":     guiVersion,
+		"account":     sess.Account(),
+		"pendingPlan": pending,
 	})
 }
 
 func (s *GuiSession) handleLog(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	lines := append([]string{}, s.log...)
+	progress := s.progress
 	s.mu.Unlock()
-	s.writeJSON(w, map[string]interface{}{"ok": true, "lines": lines})
+	s.writeJSON(w, map[string]interface{}{"ok": true, "lines": lines, "progress": progress})
+}
+
+func (s *GuiSession) observeProgress(p reconcile.Progress) {
+	s.mu.Lock()
+	phaseChanged := s.progress.Phase != p.Phase
+	s.progress.Progress = p
+	printLine := phaseChanged || time.Since(s.lastProgressLog) > 2*time.Second
+	if printLine {
+		s.lastProgressLog = time.Now()
+	}
+	s.mu.Unlock()
+	if printLine {
+		label := map[string]string{"rename": "重命名", "local": "扫描本地", "cloud": "扫描云端", "hash": "核对内容", "hash-upload": "准备上传", "transfer": "正在上传", "upload": "文件处理", "verify": "核验写入", "mkdir": "创建目录", "remove": "清理多余项", "planned": "预览完成", "recheck": "执行前复核", "recheck-remove": "清理前复核"}[p.Phase]
+		if label == "" {
+			label = p.Phase
+		}
+		line := label
+		if p.Total > 0 && p.Phase != "transfer" && p.Phase != "hash-upload" {
+			line += fmt.Sprintf(" %d/%d", p.Done, p.Total)
+		}
+		if p.Current != "" {
+			line += " · " + p.Current
+		}
+		s.appendLog(line)
+	}
 }
 
 func (s *GuiSession) handleQuit(w http.ResponseWriter, r *http.Request) {
@@ -241,7 +301,7 @@ func (s *GuiSession) handleProbe(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, errors.New("请求格式错误: "+err.Error()))
 		return
 	}
-	sess := &ReconcileSession{Observer: s.appendLog}
+	sess := &ReconcileSession{Observer: s.appendLog, Progress: s.observeProgress}
 	report, err := sess.Probe(ReconcileProbeOptions{
 		RemoteRoot:    req.RemoteRoot,
 		LocalDir:      req.LocalDir,
@@ -253,6 +313,11 @@ func (s *GuiSession) handleProbe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	path, saveErr := SaveProbeReport(report)
+	if len(report.Errors) > 0 {
+		s.mu.Lock()
+		s.progress.Status = "warning"
+		s.mu.Unlock()
+	}
 	if saveErr != nil {
 		s.appendLog("警告: 未能保存探测报告: " + saveErr.Error())
 	} else {
@@ -275,7 +340,7 @@ func (s *GuiSession) handlePlan(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, errors.New("请求格式错误: "+err.Error()))
 		return
 	}
-	sess := &ReconcileSession{Observer: s.appendLog}
+	sess := &ReconcileSession{Observer: s.appendLog, Progress: s.observeProgress}
 	report, plan, err := sess.Plan(ReconcilePlanOptions{
 		LocalRoot:    req.LocalDir,
 		RemoteRoot:   req.RemoteRoot,
@@ -290,6 +355,9 @@ func (s *GuiSession) handlePlan(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	s.plan = plan
 	s.report = report
+	if !plan.ScanComplete || !plan.LocalScanComplete {
+		s.progress.Status = "warning"
+	}
 	s.mu.Unlock()
 
 	path, saveErr := SavePlanReport(report)
@@ -326,7 +394,7 @@ func (s *GuiSession) handleApply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sess := &ReconcileSession{Observer: s.appendLog}
+	sess := &ReconcileSession{Observer: s.appendLog, Progress: s.observeProgress}
 	report, err := sess.Apply(ApplyOptions{
 		Plan:               plan,
 		RemovalMode:        req.RemovalMode,
@@ -338,18 +406,52 @@ func (s *GuiSession) handleApply(w http.ResponseWriter, r *http.Request) {
 		MaxRemoveBytes:     req.MaxRemoveBytes,
 	})
 	if err != nil {
-		s.fail(w, err)
+		// All executor errors before item results are preflight failures. Keep
+		// the expensive preview available after login or local access recovers.
+		if report == nil || len(report.Renames)+len(report.Removes) == 0 {
+			s.mu.Lock()
+			s.plan = plan
+			s.report = reconcile.BuildPlanReport(plan, "执行前检查未通过，保留预览")
+			s.mu.Unlock()
+		} else {
+			s.finishApply(plan, report)
+		}
+		s.mu.Lock()
+		remaining := s.report
+		s.mu.Unlock()
+		s.appendLog("执行未开始或未完成: " + err.Error())
+		s.mu.Lock()
+		s.progress.Status = "error"
+		s.mu.Unlock()
+		s.writeJSON(w, map[string]interface{}{"ok": false, "error": err.Error(), "remainingReport": remaining})
 		return
 	}
+	remaining := s.finishApply(plan, report)
 	path, saveErr := SaveApplyReport(report)
 	if saveErr != nil {
 		s.appendLog("警告: 未能保存执行记录: " + saveErr.Error())
 	} else {
 		s.appendLog("执行记录已保存: " + path)
 	}
-	s.appendLog("执行完成; 计划已失效, 如需继续请重新预览差异")
+	s.appendLog("本次可执行项已处理；失败项可单独重试，其他项不会重复执行")
 
-	s.writeJSON(w, map[string]interface{}{"ok": true, "report": report.ToJSON(), "savedTo": path})
+	s.writeJSON(w, map[string]interface{}{"ok": true, "report": report.ToJSON(), "savedTo": path, "remainingReport": remaining})
+}
+
+func (s *GuiSession) finishApply(plan *reconcile.Plan, report *reconcile.ApplyReport) *reconcile.PlanReport {
+	remaining := reconcile.RemainingPlan(plan, report)
+	var preview *reconcile.PlanReport
+	if remaining != nil {
+		preview = reconcile.BuildPlanReport(remaining, "仅重试未完成项（无需重新全盘扫描）")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.plan = remaining
+	s.report = preview
+	if !report.Succeeded() {
+		s.progress.Status = "warning"
+	}
+	return preview
 }
 
 // isFlagPassed reports whether a CLI flag is present in os.Args.

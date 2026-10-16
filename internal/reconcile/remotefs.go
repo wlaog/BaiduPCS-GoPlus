@@ -1,11 +1,11 @@
-// Package reconcile implements a one-way, manually triggered "make the cloud
-// backup directory match the local directory" mirror for BaiduPCS-Go.
+// Package reconcile plans manual cleanup of official cloud backups using the
+// local directory as its reference. Uploads and mkdir belong to the backup client.
 //
 // Design constraints (see README_BaiduPCS_Backup_Reconcile.md):
 //   - The local directory is the only source of truth; nothing ever writes to it.
 //   - Cloud changes are only ever made inside one caller-supplied remote root.
 //   - Default mode is dry-run; destructive steps need explicit confirmation.
-//   - Every cloud removal is a move into a quarantine area, never a hard delete.
+//   - Removals use the provider's recycle bin, never permanent deletion.
 //
 // This file defines the abstraction the rest of the package is written against,
 // so the planning logic can be unit-tested with an in-memory fake and never
@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/qjfoidnh/BaiduPCS-Go/baidupcs"
@@ -42,12 +43,12 @@ type RemoteEntry struct {
 	// meta API, normalised to lowercase.
 	//
 	// Measured against a live account, this is the FULL-file MD5 and is correct
-	// for multi-block files too. It is still not treated as infallible: a match
-	// is used as proof of equality and a mismatch only causes a re-upload, so a
-	// stale server value can cost a redundant upload but never a missed update.
+	// for the tested multi-block files too. Equality decisions depend on the
+	// provider reporting it correctly; format validation cannot detect a stale
+	// server value, and this package does not download every file to verify it.
 	ContentMD5 string
-	// ContentMD5Trusted reports whether ContentMD5 is a syntactically valid
-	// content hash and therefore usable for the equality test above.
+	// ContentMD5Trusted reports whether the provider hash has a usable format.
+	// It is not an independent verification of the remote file's bytes.
 	ContentMD5Trusted bool
 	// BlockCount is len(block_list) as returned by the server; the list API
 	// returns none, so this is usually 0 and is informational only.
@@ -78,16 +79,23 @@ type RemoteFS struct {
 	// time.Sleep.
 	Sleep func(time.Duration)
 	// Log receives one line per retry. Nil disables logging.
-	Log func(string)
+	Log           func(string)
+	BeforeRequest func()
 
-	// lastRequest serialises pacing across calls. Only touched from the scan
-	// goroutine, which walks directories sequentially.
+	// lastRequest is protected by paceMu across concurrent listing calls.
 	lastRequest time.Time
+	paceMu      sync.Mutex
 }
 
 // pace enforces at most one request per Retry.Spacing. It is a no-op while
 // requests are already spaced naturally, so a healthy scan is not slowed down.
 func (r *RemoteFS) pace() {
+	if r.BeforeRequest != nil {
+		r.BeforeRequest()
+		return
+	}
+	r.paceMu.Lock()
+	defer r.paceMu.Unlock()
 	policy := r.Retry.withDefaults()
 	if policy.Spacing <= 0 {
 		return
@@ -102,7 +110,7 @@ func (r *RemoteFS) pace() {
 
 // NewRemoteFS wraps an authenticated upstream client.
 func NewRemoteFS(pcs *baidupcs.BaiduPCS) *RemoteFS {
-	return &RemoteFS{PCS: pcs}
+	return &RemoteFS{PCS: pcs, Retry: DefaultRetryPolicy()}
 }
 
 func (r *RemoteFS) sleep(d time.Duration) {
@@ -136,9 +144,9 @@ func (r *RemoteFS) ListDir(remotePath string) ([]RemoteEntry, error) {
 	policy := r.Retry.withDefaults()
 
 	var list baidupcs.FileDirectoryList
-	err, attempts, exhausted := withRetry(policy, r.sleep, r.pace, func() error {
+	err, attempts, exhausted := withRetry(policy, r.sleep, nil, func() error {
 		var pcsErr pcserror.Error
-		list, pcsErr = r.PCS.FilesDirectoriesList(remotePath, baidupcs.DefaultOrderOptions)
+		list, pcsErr = r.PCS.CopyPCS().FilesDirectoriesListWithPacing(remotePath, baidupcs.DefaultOrderOptions, r.pace)
 		if pcsErr != nil {
 			return wrapPCSError("列出云端目录", remotePath, pcsErr)
 		}
@@ -182,7 +190,7 @@ func (r *RemoteFS) Meta(remotePath string) (RemoteEntry, error) {
 	var fd *baidupcs.FileDirectory
 	err, _, exhausted := withRetry(policy, r.sleep, r.pace, func() error {
 		var pcsErr pcserror.Error
-		fd, pcsErr = r.PCS.FilesDirectoriesMeta(remotePath)
+		fd, pcsErr = r.PCS.CopyPCS().FilesDirectoriesMeta(remotePath)
 		if pcsErr != nil {
 			return wrapPCSError("获取云端元信息", remotePath, pcsErr)
 		}
@@ -223,10 +231,9 @@ func convertFileDirectory(fd *baidupcs.FileDirectory) RemoteEntry {
 // at all, so requiring a single block (as upstream's own display logic does)
 // would discard a working equality proof and re-upload identical files.
 //
-// Trusting it is safe in the direction this package uses it: a hash match is
-// taken as proof of equality and a mismatch only triggers a re-upload. A
-// server-side stale md5 (upstream warns these can occur after chunked uploads)
-// therefore costs at most a redundant upload, never a missed update.
+// This checks syntax only. A provider returning a stale hash can still make
+// metadata-based equality checks wrong; a complete remote byte audit would
+// require downloading the content.
 func looksLikeMD5(s string) bool {
 	if len(s) != 32 {
 		return false

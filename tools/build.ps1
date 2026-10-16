@@ -66,7 +66,7 @@ try {
 
   if ($Test) {
     Write-Host "Running reconcile, GUI and upload regression tests..."
-    & $goExe test -count=1 ./internal/reconcile/... ./internal/pcscommand ./internal/pcsfunctions/pcsupload
+    & $goExe test -count=1 ./internal/reconcile/... ./internal/pcscommand ./internal/pcsfunctions/pcsupload ./baidupcs
     if ($LASTEXITCODE -ne 0) { throw "tests failed with exit code $LASTEXITCODE" }
   }
 

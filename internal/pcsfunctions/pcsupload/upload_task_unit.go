@@ -30,6 +30,11 @@ type (
 		Step              StepUpload
 		SavePath          string // 保存路径
 		PrintFormat       string
+		// Progress is optional; existing CLI output remains unchanged.
+		Progress func(uploaded, total int64)
+		// SkipRemoteCheck is used after reconcile has checked the exact target
+		// without a cache. It also avoids listing the entire parent per file.
+		SkipRemoteCheck bool
 
 		PCS               *baidupcs.BaiduPCS
 		UploadingDatabase *UploadingDatabase // 数据库
@@ -152,7 +157,11 @@ func (utu *UploadTaskUnit) rapidUpload() (isContinue bool, result *taskframework
 	// TODO: 建立一个通过百度错误码判断重试的函数
 	result = &taskframework.TaskUnitRunResult{}
 
-	fdl, pcsError := utu.PCS.CacheFilesDirectoriesList(utu.panDir, baidupcs.DefaultOrderOptions)
+	var fdl baidupcs.FileDirectoryList
+	var pcsError pcserror.Error
+	if !utu.SkipRemoteCheck {
+		fdl, pcsError = utu.PCS.CacheFilesDirectoriesList(utu.panDir, baidupcs.DefaultOrderOptions)
+	}
 	if pcsError != nil {
 		switch pcsError.GetErrType() {
 		case pcserror.ErrTypeRemoteError:
@@ -318,6 +327,9 @@ func (utu *UploadTaskUnit) upload() (result *taskframework.TaskUnitRunResult) {
 	defer UnregisterActiveUploader(muer)
 
 	muer.OnUploadStatusEvent(func(status uploader.Status, updateChan <-chan struct{}) {
+		if utu.Progress != nil {
+			utu.Progress(status.Uploaded(), status.TotalSize())
+		}
 		select {
 		case <-updateChan:
 			if utu.state.Uploadid != "" {

@@ -107,7 +107,7 @@ func (f *fakeFS) addPath(root, line string) {
 				if _, ok := f.dirs[childPath]; !ok {
 					f.dirs[childPath] = nil
 				}
-				f.metas[childPath] = RemoteEntry{Path: childPath, Name: name, IsDir: true}
+				f.metas[childPath] = entry
 			} else {
 				f.metas[childPath] = entry
 			}

@@ -26,7 +26,7 @@ func (pcs *BaiduPCS) Move(cpmvJSON ...*CpMvJSON) (pcsError pcserror.Error) {
 func (pcs *BaiduPCS) cpmvOp(op string, cpmvJSON ...*CpMvJSON) (pcsError pcserror.Error) {
 	dataReadCloser, err := pcs.prepareCpMvOp(op, cpmvJSON...)
 	if err != nil {
-		return
+		return err
 	}
 
 	defer dataReadCloser.Close()

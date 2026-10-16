@@ -92,14 +92,18 @@ th{color:var(--muted);font-weight:600;background:#fafbfc}
 .tally{display:flex;gap:20px;flex-wrap:wrap;margin-bottom:12px}
 .tally div{background:#fafbfc;border:1px solid var(--line);border-radius:8px;padding:8px 14px}
 .tally b{display:block;font-size:19px}
-.k-UPLOAD{color:var(--add);font-weight:700}
-.k-REPLACE{color:var(--warn);font-weight:700}
+.k-RENAME{color:var(--add);font-weight:700}
+.k-WAIT{color:var(--warn);font-weight:700}
 .k-REMOVE{color:var(--del);font-weight:700}
 .k-KEEP{color:var(--muted);font-weight:700}
 .k-CONFLICT{color:var(--del);font-weight:700}
 .k-MKDIR{color:var(--accent);font-weight:700}
 pre#log{background:#0d1117;color:#c9d1d9;padding:12px;border-radius:8px;max-height:260px;
   overflow:auto;font-size:12px;line-height:1.5;white-space:pre-wrap;margin:0}
+.progress-heading{display:flex;justify-content:space-between;gap:12px;align-items:center}
+.progress-heading h2{margin:0}.progress-meta{font-size:12px;color:var(--muted);margin:8px 0;overflow-wrap:anywhere}
+progress{width:100%;height:10px;accent-color:var(--accent);display:block;margin:12px 0}
+.live-log{font:12px/1.65 Consolas,"Microsoft YaHei",monospace;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--muted);margin:12px 0 0;max-height:145px;overflow:auto}
 .hidden{display:none}
 .badge{display:inline-block;padding:1px 8px;border-radius:20px;font-size:12px;
   border:1px solid var(--line);background:#fafbfc;color:var(--muted)}
@@ -144,84 +148,22 @@ dialog::backdrop{background:#18223066} .picker-head,.picker-foot{padding:18px 22
   <span class="sub"><button id="btnQuit">关闭界面</button></span>
 </header>
 
-<p class="intro">以本地文件夹为准，手动整理对应的云端目录。先预览，确认后执行。</p>
+<p class="intro">仅清理和重命名云端文件，上传与新建目录由百度网盘自动备份完成。</p>
 
-<!-- ===================== 使用说明 ===================== -->
-<details class="card help" id="usageGuide">
-  <summary>使用说明与恢复方法</summary>
-  <div class="details-body">
-  <ol class="steps">
-    <li>
-      <b>确认已登录</b>
-      本界面复用 BaiduPCS-Go 已配置的账号，右上角应显示绿色账号状态。
-      若显示未登录，请先在命令行执行 <code>BaiduPCS-Go login</code>，
-      再重新打开本界面。
-    </li>
-    <li>
-      <b>找出云端备份目录（可选：只读探测）</b>
-      勾选「扫描云端根目录」后点击 <b>开始只读探测</b>。它会列出云端根目录下
-      形如 <code>来自：本地电脑</code> 的备份目录，并核对本地与云端。
-      <span class="hint">探测是只读的，不会改动任何内容，可以放心反复执行。</span>
-    </li>
-    <li>
-      <b>填写两个目录（一一对应）</b>
-      选择或填写<b>本地目录</b>（权威源，例如 <code>D:\WorkSync</code>），
-      以及<b>云端目录</b>（要整理成和本地一样的那个，例如
-      <code>/来自：本地电脑/WorkSync</code>）。
-      <span class="hint">云端目录必须是具体子目录，不能填 <code>/</code>。</span>
-    </li>
-    <li>
-      <b>预览差异（第 1 步：只读）</b>
-      点击 <b>预览差异</b>。它会逐项列出五类结果：
-      <span class="k-UPLOAD">UPLOAD</span> 云端缺失、
-      <span class="k-REPLACE">REPLACE</span> 同路径但内容不同、
-      <span class="k-REMOVE">REMOVE</span> 云端多余、
-      <span class="k-KEEP">KEEP</span> 已一致、
-      <span class="k-CONFLICT">CONFLICT</span> 需人工判断。
-      <span class="hint">勾选「计算内容哈希」判定更精确（会读取本地文件，稍慢）；
-      无法确认内容一致时会保守地重新上传或标记冲突。</span>
-    </li>
-    <li>
-      <b>检查预览结果</b>
-      重点看 <b>REMOVE</b> 列表是不是真的都不需要了，以及有没有 <b>CONFLICT</b>。
-      <span class="hint">已确认一致的项不会出现在变更里。本地真实存在的
-      <code>paper(1).docx</code> 会被保留，不会因为名字像副本就被删除。</span>
-    </li>
-    <li>
-      <b>执行对齐（第 2 步：会修改云端）</b>
-      点击 <b>执行对齐</b> 并确认。执行顺序是：
-      建目录 → 上传/覆盖 → <b>重新校验写入确实生效</b> → 处理多余项。
-      任何一步失败都会<strong>跳过后续清理</strong>，因为云端副本只有在本地对应版本
-      确认上传成功之后才算"多余"。
-    </li>
-    <li>
-      <b>需要时恢复</b>
-      默认清理方式是<b>隔离区</b>：多余项被移动到
-      <code>/BackupReconcile_Quarantine/&lt;时间戳&gt;/</code>，保留原相对路径，
-      在网盘里移回原位置即可恢复。<b>不会永久删除，也不会清空回收站。</b>
-    </li>
-    <li>
-      <b>确认结果</b>
-      执行完成后再次点击 <b>预览差异</b>，应当显示<b>零差异</b>。
-      每次探测 / 预览 / 执行都会保存 JSON 记录，结果中会显示报告路径。
-    </li>
-  </ol>
+<section class="card hidden" id="operationProgress" aria-label="操作进度">
+  <div class="progress-heading"><h2 id="progressTitle" role="status">等待开始</h2><span class="hint" id="progressElapsed"></span></div>
+  <progress id="progressBar" max="100" aria-label="当前阶段进度"></progress>
+  <div class="progress-meta" id="progressMeta"></div>
+  <pre class="live-log" id="liveLog" aria-label="最近运行日志"></pre>
+</section>
 
-  <details>
-    <summary>安全设计说明（建议读一遍）</summary>
-    <ul>
-      <li><b>只读优先：</b>探测和预览完全不写云端，可反复执行。</li>
-      <li><b>不做永久删除：</b>清理只有两种方式 —— 移入隔离区（默认）或移入网盘回收站，都需要显式确认。</li>
-      <li><b>不触碰本地文件：</b>本地目录只被读取（大小、修改时间、哈希），绝不会被修改或删除。</li>
-      <li><b>不越界：</b>所有操作都被限制在你填写的云端目录之内。</li>
-      <li><b>阈值保护：</b>一次性清理超过云端文件数 10% 或超过 10GB 时，需要额外勾选确认。</li>
-      <li><b>半写入保护：</b>若某文件在预览之后又被修改，执行时会跳过它并提示，不会把写了一半的文件当定稿上传。</li>
-      <li><b>不完整即停止：</b>若云端目录枚举不完整（网络/限流/权限），直接拒绝执行，不做任何改动。</li>
-      <li><b>官方自动备份：</b>仍由百度网盘官方客户端管理；执行整理前请确认对应任务没有同时上传。</li>
-    </ul>
-  </details>
-  </div>
-</details>
+<details class="card help" id="usageGuide"><summary>使用说明与恢复方法</summary><div class="details-body">
+<ol class="steps"><li><b>先完成官方自动备份</b>本工具不上传、不覆盖内容、不新建目录。云端没有最新内容时，会显示 WAIT 并保留相关历史版本。</li>
+<li><b>预览并核对目录</b>RENAME 按内容匹配正确版本，REMOVE 清理本地已不存在的内容；本地真实存在的带括号文件名会保留。</li>
+<li><b>确认后整理</b>删除进入网盘回收站。失败项跳过，其他独立项继续；对应正确版本尚未就位时保留其历史副本。</li>
+<li><b>重试与恢复</b>保持启动窗口运行，可仅重试未完成项，刷新页面也能恢复待重试计划。关闭服务后需要重新预览。回收站期限以网盘为准。</li></ol>
+<p class="hint">删除和重命名仍可能与官方任务竞争，建议等该备份任务空闲或暂停后整理。程序会复核每项状态，但不提供服务端锁。</p>
+</div></details>
 
 <!-- ===================== 第 1 步 探测 ===================== -->
 <details class="card help" id="probePanel">
@@ -264,8 +206,8 @@ dialog::backdrop{background:#18223066} .picker-head,.picker-foot{padding:18px 22
     </div>
   </div>
   <details class="advanced"><summary>比较选项</summary>
-    <label class="check"><input type="checkbox" id="hashFiles" checked>核对文件内容（推荐；读取本地文件计算哈希）</label>
-    <label class="check"><input type="checkbox" id="conservative">无法确认内容一致时，留待人工处理</label>
+    <label class="check"><input type="checkbox" id="hashFiles" checked>重新核对完整内容（推荐）</label>
+    <p class="field-note">取消后使用快速校验：复用大小和修改时间未变的文件哈希，减少读盘；可能漏掉保留原大小和时间的内容修改。</p>
   </details>
   <div class="actions">
     <button class="primary" id="btnPlan">预览差异</button>
@@ -279,27 +221,18 @@ dialog::backdrop{background:#18223066} .picker-head,.picker-foot{padding:18px 22
   <div id="applyBlocked" class="hint">请先选择两个目录并预览差异。</div>
   <div id="applyReady" class="hidden">
     <div id="cleanupSummary" class="banner"></div>
-    <label>清理方式</label>
-    <select id="removalMode">
-      <option value="quarantine">移入隔离区（推荐，可移回恢复）</option>
-      <option value="recycle">移入网盘回收站（恢复期限以网盘为准）</option>
-    </select>
-    <details class="advanced" id="quarantineOptions"><summary>自定义隔离区位置</summary>
-      <label for="quarantineRoot">隔离区目录（留空使用默认位置）</label>
-      <input type="text" id="quarantineRoot" placeholder="/BackupReconcile_Quarantine">
-    </details>
+    <div class="hint">删除进入网盘回收站，恢复期限以网盘实际显示为准。失败项会保留并继续其他独立项。</div>
     <div style="margin-top:10px">
-      <label class="check"><input type="checkbox" id="confirmRemoval">同时清理预览中列出的云端多余文件</label>
-      <p class="field-note">不勾选则只上传和覆盖，保留云端多余文件。</p>
+      <label class="check"><input type="checkbox" id="confirmRemoval">我已核对预览，确认执行本次删除与重命名</label>
     </div>
     <div id="blastWarning" class="banner warn hidden">
-      <strong>本次清理较多，需要再确认一次</strong>
+      <strong>清理较多或包含未展开目录，请核对范围</strong>
       <p id="blastSummary"></p>
-      <p>当清理文件数超过此云端目录文件总数的 10%，或清理容量超过 10 GB 时，会触发此保护。例如：云端有 100 个文件，清理 11 个就需要额外确认。</p>
-      <label class="check"><input type="checkbox" id="ackBlast">我已核对预览中的多余文件，确认继续本次大批量清理</label>
+      <p>清理超过文件数 10% 或 10 GB，或整目录未展开、无法统计内部数量时，需要额外确认。整目录回收包含其全部内容，包括内部临时文件。</p>
+      <label class="check"><input type="checkbox" id="ackBlast">我已核对清理范围，确认包括所列目录的全部内容</label>
     </div>
     <div class="actions">
-      <button class="danger" id="btnApply">执行对齐</button>
+      <button class="danger" id="btnApply">执行整理</button>
     </div>
   </div>
   <div id="applyOut" class="hidden" style="margin-top:14px"></div>
@@ -345,10 +278,10 @@ function size(n){
 async function request(path, options){
   let r;
   try{ r = await fetch(api(path), options); }
-  catch(e){ throw new Error("与本地服务的连接已中断。操作可能已部分完成，请检查启动窗口和运行日志；恢复连接后重新预览差异，不要直接重复执行。"); }
+  catch(e){ throw new Error("与本地服务的连接已中断。操作可能已部分完成，请检查启动窗口和运行日志；连接恢复且操作结束后刷新页面恢复剩余计划，不要直接重复执行。"); }
   let j;
   try{ j = await r.json(); }
-  catch(e){ throw new Error("本地服务未返回有效结果（HTTP "+r.status+"），请查看启动窗口并重新预览差异。"); }
+  catch(e){ throw new Error("本地服务未返回有效结果（HTTP "+r.status+"），请查看启动窗口，待操作结束后刷新页面恢复剩余计划。"); }
   if(!r.ok) throw new Error(j.error || "本地服务请求失败（HTTP "+r.status+"），请查看运行日志。");
   return j;
 }
@@ -359,8 +292,20 @@ async function post(path, body){
   }catch(e){ return {ok:false, error:e.message}; }
 }
 function show(id, html){ const el=document.getElementById(id); el.innerHTML=html; el.classList.remove("hidden"); }
+let busyControls = [];
 function busy(btn, on, label){
-  btn.disabled = on;
+  if(on){
+    busyControls = Array.from(document.querySelectorAll("button,input,select")).filter(el=>el.id!=="btnLog");
+    busyControls.forEach(el=>{el.dataset.beforeBusy=el.disabled?"1":"0";el.disabled=true;});
+    document.getElementById("operationProgress").classList.remove("hidden");
+    document.getElementById("progressTitle").textContent=label||"准备开始…";
+    document.getElementById("progressMeta").textContent="正在准备，请稍候…";
+    document.getElementById("progressBar").removeAttribute("value");
+    document.getElementById("progressBar").classList.remove("hidden");
+  }else{
+    busyControls.forEach(el=>{el.disabled=el.dataset.beforeBusy==="1";delete el.dataset.beforeBusy;});busyControls=[];
+    refreshLog();
+  }
   if(on){ btn.dataset.orig = btn.textContent; btn.textContent = label || "处理中…"; }
   else if(btn.dataset.orig){ btn.textContent = btn.dataset.orig; }
 }
@@ -378,40 +323,25 @@ function invalidatePlan(){
   document.getElementById("confirmRemoval").checked = false;
   document.getElementById("ackBlast").checked = false;
 }
-for(const id of ["localDir", "remoteRoot", "hashFiles", "conservative"]){
+for(const id of ["localDir", "remoteRoot", "hashFiles"]){
   document.getElementById(id).addEventListener("input", invalidatePlan);
 }
 function removalStats(report){
   const s = report.summary;
   const percent = s.cloudFiles > 0 ? s.removeFiles / s.cloudFiles * 100 : 0;
-  return {percent, exceeds: percent > 10 || s.removeBytes > 10*1024*1024*1024};
+  return {percent, exceeds: (s.unscannedRemoveDirs||0)>0 || percent > 10 || s.removeBytes > 10*1024*1024*1024};
 }
 function updateCleanupOptions(){
-  const mode = document.getElementById("removalMode").value;
-  document.getElementById("quarantineOptions").classList.toggle("hidden", mode !== "quarantine");
-  if(!currentPlan) return;
-  const s = currentPlan.summary, risk = removalStats(currentPlan);
-  const clean = document.getElementById("confirmRemoval").checked;
-  const destination = mode === "quarantine" ? "隔离区" : "网盘回收站";
-  document.getElementById("cleanupSummary").textContent = "本次将上传 " + currentPlan.counts.upload + " 个新文件、覆盖 " + currentPlan.counts.replace
-    + " 个文件。云端多余：" + s.removeFiles + " 个文件、" + s.removeDirs + " 个目录（" + size(s.removeBytes) + "）。"
-    + (clean ? "多余项将移入" + destination + "。" : "当前保留云端多余项。");
-  document.getElementById("blastSummary").textContent = "拟清理 " + s.removeFiles + " / " + s.cloudFiles
-    + " 个云端文件（" + risk.percent.toFixed(1) + "%），合计 " + size(s.removeBytes) + "。";
-  document.getElementById("blastWarning").classList.toggle("hidden", !clean || !risk.exceeds);
-  document.getElementById("ackBlast").disabled = !clean || !risk.exceeds;
-  document.getElementById("btnApply").disabled = clean && risk.exceeds && !document.getElementById("ackBlast").checked;
-  document.getElementById("btnApply").textContent = clean ? "执行对齐并清理" : "执行上传与覆盖";
+  if(!currentPlan)return;
+  const s=currentPlan.summary,risk=removalStats(currentPlan);
+  const opaque=s.unscannedRemoveDirs||0;
+  document.getElementById("cleanupSummary").textContent="重命名 "+currentPlan.counts.rename+" 项；回收已统计文件 "+s.removeFiles+" 个（含重命名前同名旧版，"+size(s.removeBytes)+"）"+(opaque?"；另整目录回收 "+opaque+" 项及其全部内容，内部数量与容量未统计":"")+"。等待备份与需判断的项将保留。";
+  document.getElementById("blastWarning").classList.toggle("hidden",!risk.exceeds);
+  document.getElementById("blastSummary").textContent=opaque?"另有 "+opaque+" 个目录将连同全部内容一次回收；未扫描内部文件，无法判断其是否超过 10% 或 10 GB。":"拟清理 "+s.removeFiles+" 个文件，占云端 "+risk.percent.toFixed(1)+"%，共 "+size(s.removeBytes)+"。";
+  if(!busyControls.length)document.getElementById("btnApply").disabled=!document.getElementById("confirmRemoval").checked;
 }
-document.getElementById("confirmRemoval").onchange = () => {
-  document.getElementById("ackBlast").checked = false;
-  updateCleanupOptions();
-};
-document.getElementById("ackBlast").onchange = updateCleanupOptions;
-document.getElementById("removalMode").onchange = () => {
-  document.getElementById("ackBlast").checked = false;
-  updateCleanupOptions();
-};
+document.getElementById("confirmRemoval").onchange=updateCleanupOptions;
+document.getElementById("ackBlast").onchange=updateCleanupOptions;
 
 // ---------- folder browser (read-only) ----------
 const picker = document.getElementById("folderPicker");
@@ -480,10 +410,20 @@ document.getElementById("pickerSelect").onclick = () => {
 };
 
 // ---------- account ----------
+let initialPlanRestore=true;
 async function refreshAccount(){
   const b = document.getElementById("badgeAccount");
   try{
     const j = await request("/api/state");
+    if(initialPlanRestore){
+      initialPlanRestore=false;
+      if(j.pendingPlan){
+        document.getElementById("localDir").value=j.pendingPlan.localRoot;
+        document.getElementById("remoteRoot").value=j.pendingPlan.remoteRoot;
+        renderPlan(j.pendingPlan);
+        document.getElementById("btnApply").textContent="执行剩余整理项";
+      }
+    }
     b.title = j.account ? "配置目录：" + j.account.configDir : "";
     if(j.account && j.account.loggedIn){
       b.textContent = "已登录: " + j.account.name;
@@ -539,157 +479,136 @@ document.getElementById("btnProbe").onclick = async (ev) => {
   } finally { busy(btn, false); refreshAccount(); }
 };
 
-// ---------- plan ----------
-document.getElementById("btnPlan").onclick = async (ev) => {
-  invalidatePlan();
-  const epoch = planEpoch;
-  const btn = ev.target; busy(btn, true, "扫描中…");
-  try{
-    const j = await post("/api/plan", {
-      localDir: document.getElementById("localDir").value.trim(),
-      remoteRoot: document.getElementById("remoteRoot").value.trim(),
-      hashFiles: document.getElementById("hashFiles").checked,
-      conservative: document.getElementById("conservative").checked
+// ---------- cleanup preview ----------
+function renderPlan(r, savedTo){
+  currentPlan=r;
+  let h="<div class='tally'>"
+    +"<div><b class='k-RENAME'>"+r.counts.rename+"</b>RENAME 重命名</div>"
+    +"<div><b class='k-REMOVE'>"+r.counts.remove+"</b>REMOVE 多余项</div>"
+    +"<div><b class='k-KEEP'>"+r.counts.keep+"</b>KEEP 已一致</div>"
+    +"<div><b class='k-WAIT'>"+r.counts.pending+"</b>WAIT 等待备份</div>"
+    +"<div><b class='k-CONFLICT'>"+r.counts.conflict+"</b>跳过 / 需判断</div></div>";
+  h+="<div class='hint'>本地 "+r.summary.localFiles+" 文件 / 云端已扫描 "+r.summary.cloudFiles
+    +" 文件；拟回收已统计文件 "+r.summary.removeFiles+" 个（含重命名前同名旧版），共 "+size(r.summary.removeBytes)+"。</div>";
+  if(r.summary.unscannedRemoveDirs)h+="<div class='banner warn'>另有 "+r.summary.unscannedRemoveDirs+" 个目录整棵回收（包含全部内容和内部临时文件）；未向下扫描，内部文件数量与容量不计入上述统计。</div>";
+  if(r.performance)h+="<div class='hint'>内容读取 "+size(r.performance.hashBytes)+"；复用 "+r.performance.cacheHits+" 个哈希缓存；云端目录请求 "+r.performance.cloudListings+" 次。</div>";
+  function section(title,note,items){
+    if(!items?.length)return "";
+    let s="<h3 style='font-size:14px;margin-top:14px'>"+title+" ("+items.length+")</h3><div class='hint'>"+note+"</div>";
+    s+="<div class='table-wrap'><table><tr><th>相对路径</th><th>说明</th></tr>";
+    items.slice(0,300).forEach(a=>{
+      s+="<tr><td>"+esc(a.relPath)+(a.isDir?"/":"")+"</td><td>"+esc(a.reason);
+      if(a.sourcePath)s+="<div class='hint'>来源："+esc(a.sourcePath)+"</div>";
+      s+="</td></tr>";
     });
-    if(epoch !== planEpoch) return;
-    if(!j.ok){
-      show("planOut", '<div class="banner warn">'+esc(j.error)+'</div>');
-      document.getElementById("applyReady").classList.add("hidden");
-      document.getElementById("applyBlocked").classList.remove("hidden");
-      return;
-    }
-    const r = j.report;
-    currentPlan = r;
-    let h = "<div class='tally'>"
-      + "<div><b class='k-UPLOAD'>"+r.counts.upload+"</b>UPLOAD 待上传</div>"
-      + "<div><b class='k-REPLACE'>"+r.counts.replace+"</b>REPLACE 待覆盖</div>"
-      + "<div><b class='k-MKDIR'>"+r.counts.mkdir+"</b>MKDIR 待建目录</div>"
-      + "<div><b class='k-REMOVE'>"+r.counts.remove+"</b>REMOVE 云端多余</div>"
-      + "<div><b class='k-KEEP'>"+r.counts.keep+"</b>KEEP 已一致</div>"
-      + "<div><b class='k-CONFLICT'>"+r.counts.conflict+"</b>CONFLICT 需判断</div>"
-      + "</div>";
-    h += "<div class='hint'>本地 "+r.summary.localFiles+" 文件 / 云端 "+r.summary.cloudFiles
-      + " 文件；预计上传 "+size(r.summary.uploadBytes)+"，清理 "+r.summary.removeFiles+" 文件 ("
-      + size(r.summary.removeBytes)+")。</div>";
-
-    const section = (title, note, items) => {
-      if(!items || !items.length) return "";
-      let s = "<h3 style='font-size:14px;margin-top:14px'>"+title+" ("+items.length+")</h3>";
-      if(note) s += "<div class='hint'>"+note+"</div>";
-      s += "<div class='table-wrap'><table><tr><th>相对路径</th><th>大小</th><th>说明</th></tr>";
-      items.slice(0,300).forEach(a => {
-        s += "<tr><td>"+esc(a.relPath)+(a.isDir?"/":"")+"</td><td>"+size(a.size)+"</td><td>"
-          + esc(a.reason||a.rule||"")+"</td></tr>";
-      });
-      if(items.length>300) s += "<tr><td colspan=3 class='hint'>其余 "+(items.length-300)+" 项见 JSON 报告</td></tr>";
-      return s + "</table></div>";
-    };
-    h += section("UPLOAD 将要上传", "", r.uploads);
-    h += section("REPLACE 将要覆盖", "覆盖会替换云端现有内容，请先核对差异。", r.replaces);
-    h += section("MKDIR 将要创建的云端目录", "", r.mkdirs);
-    h += section("REMOVE 云端多余项", "执行时默认移入隔离区，不永久删除。", r.removes);
-    h += section("CONFLICT 需要你人工判断", "这些项不会被自动处理。", r.conflicts);
-
-    if(r.blockers && r.blockers.length){
-      h += '<div class="banner warn"><b>阻止项（执行前必须解决）</b><ul style="margin:6px 0 0;padding-left:20px">';
-      r.blockers.forEach(b => h += "<li>"+esc(b)+"</li>");
-      h += "</ul></div>";
-    }
-    if(j.savedTo) h += '<div class="hint" style="margin-top:8px">报告已保存: '+esc(j.savedTo)+'</div>';
-    show("planOut", h);
-
-    const hasBlockers = !!(r.blockers && r.blockers.length);
-    const hasChanges = r.summary.changes > 0 && !hasBlockers;
-    document.getElementById("confirmRemoval").disabled = r.counts.remove === 0;
-    updateCleanupOptions();
-    document.getElementById("applyReady").classList.toggle("hidden", !hasChanges);
-    document.getElementById("applyReady").dataset.hasRemoves = r.counts.remove > 0 ? "1" : "0";
-    document.getElementById("applyBlocked").classList.toggle("hidden", hasChanges);
-    if(hasBlockers){
-      document.getElementById("applyBlocked").textContent = "预览存在阻止项，请先解决后重新预览。";
-    }
-    if(!r.summary.changes){
-      document.getElementById("applyBlocked").textContent = "本次预览为零差异：云端已与本地一致，无需执行。";
-      document.getElementById("applyBlocked").classList.remove("hidden");
-    }
-  } finally { busy(btn, false); }
+    if(items.length>300)s+="<tr><td colspan=2>其余 "+(items.length-300)+" 项见报告</td></tr>";
+    return s+"</table></div>";
+  }
+  h+=section("RENAME 重命名为本地名称","已按内容确认版本；存在同名旧版时，先移入回收站。",r.renames);
+  h+=section("REMOVE 云端多余项","本地不存在的最外层目录直接整棵回收；单项失败跳过，其他独立项继续。",r.removes);
+  h+=section("WAIT 等待官方备份","尚未找到本地最新内容，保留相关历史版本。",r.pending);
+  h+=section("跳过 / 需要判断","只跳过相关文件，不阻止其他独立项。",r.conflicts);
+  if(r.blockers?.length)h+='<div class="banner warn"><b>无法执行：</b>'+r.blockers.map(esc).join("；")+'</div>';
+  if(savedTo)h+='<div class="hint">报告已保存：'+esc(savedTo)+'</div>';
+  show("planOut",h);
+  const actionable=r.summary.changes>0&&!r.blockers?.length;
+  document.getElementById("applyReady").classList.toggle("hidden",!actionable);
+  const blocked=document.getElementById("applyBlocked");blocked.classList.toggle("hidden",actionable);
+  if(!actionable)blocked.textContent=r.blockers?.length?"请先解决扫描完整性等阻止项。":
+    r.summary.zeroDifference?"云端已与本地一致，无需整理。":"暂无可执行动作；请等待官方备份完成，或处理上方需判断项。";
+  updateCleanupOptions();
+}
+document.getElementById("btnPlan").onclick=async(ev)=>{
+  invalidatePlan();const epoch=planEpoch;const btn=ev.target;busy(btn,true,"扫描中…");
+  document.getElementById("btnApply").textContent="执行整理";
+  try{
+    const j=await post("/api/plan",{localDir:document.getElementById("localDir").value.trim(),remoteRoot:document.getElementById("remoteRoot").value.trim(),hashFiles:document.getElementById("hashFiles").checked});
+    if(epoch!==planEpoch)return;
+    if(!j.ok){show("planOut",'<div class="banner warn">'+esc(j.error)+'</div>');return;}
+    renderPlan(j.report,j.savedTo);
+  }finally{busy(btn,false);updateCleanupOptions();}
 };
 
-// ---------- apply ----------
-document.getElementById("btnApply").onclick = async (ev) => {
-  if(!currentPlan){show("applyOut", '<div class="banner warn">请先重新预览差异。</div>'); return;}
-  const mode = document.getElementById("removalMode").value;
-  const confirmRemoval = document.getElementById("confirmRemoval").checked;
-  if(confirmRemoval && removalStats(currentPlan).exceeds && !document.getElementById("ackBlast").checked){
-    show("applyOut", '<div class="banner warn">本次清理量较大，请核对上方数量并勾选大批量清理确认。</div>'); return;
-  }
-  const msg = "即将对云端执行对齐。\n\n" + document.getElementById("cleanupSummary").textContent
-    + "\n\n本地目录不会被修改。确定继续?";
-  if(!window.confirm(msg)) return;
-
-  const btn = ev.target; busy(btn, true, "执行中…");
-  currentPlan = null;
-  // A lost response does not prove that the cloud was unchanged.
+// ---------- cleanup execution / retry only unfinished actions ----------
+document.getElementById("btnApply").onclick=async(ev)=>{
+  if(!currentPlan)return;
+  if(!document.getElementById("confirmRemoval").checked){show("applyOut",'<div class="banner warn">请先核对预览并确认执行本次整理。</div>');return;}
+  if(removalStats(currentPlan).exceeds&&!document.getElementById("ackBlast").checked){show("applyOut",'<div class="banner warn">请核对大批量清理数量并勾选额外确认。</div>');return;}
+  if(!window.confirm(document.getElementById("cleanupSummary").textContent+"\n\n仅删除和重命名云端文件，本地文件不会改变。确认继续？"))return;
+  const btn=ev.target;busy(btn,true,"整理中…");currentPlan=null;
   document.getElementById("applyReady").classList.add("hidden");
   document.getElementById("applyBlocked").classList.remove("hidden");
-  document.getElementById("applyBlocked").textContent = "本次执行计划已使用，请等待结果；再次执行前需要重新预览差异。";
+  document.getElementById("applyBlocked").textContent="正在逐项处理，单项失败会跳过并继续。";
   try{
-    const j = await post("/api/apply", {
-      removalMode: mode,
-      quarantineRoot: document.getElementById("quarantineRoot").value.trim(),
-      confirmRemoval: confirmRemoval,
-      acknowledgeRecycle: mode === "recycle" && confirmRemoval,
-      acknowledgeBlast: document.getElementById("ackBlast").checked,
-      maxRemovePercent: 10,
-      maxRemoveBytes: 10*1024*1024*1024
-    });
-    if(!j.ok){ show("applyOut", '<div class="banner warn">'+esc(j.error)+'</div>'); return; }
-    const r = j.report;
-    let h = "<div class='tally'>"
-      + "<div><b>"+r.mkdirs.length+"</b>建目录</div>"
-      + "<div><b>"+r.uploads.filter(x=>x.OK).length+"</b>上传成功</div>"
-      + "<div><b>"+r.removes.filter(x=>x.OK).length+"</b>清理成功</div>"
-      + "</div>";
-    h += "<div class='hint'>清理方式: "+esc(r.removalMode)
-      + (r.removalMode==="quarantine" ? "（隔离区 "+esc(r.quarantineRoot)+"/"+esc(r.runId)+"）" : "")
-      + "；耗时 "+esc(r.startedAt)+" → "+esc(r.finishedAt)+"</div>";
-    if(r.removalSkipped) h += '<div class="banner warn"><b>清理未执行：</b>'+esc(r.removalReason)+'</div>';
-    if(r.aborted) h += '<div class="banner warn"><b>已中止：</b>'+esc(r.abortReason)+'</div>';
-    const problems = [].concat(r.mkdirs, r.uploads, r.removes).filter(x => !x.OK);
-    if(problems.length){
-      h += "<h3 style='font-size:14px'>未完成 / 跳过</h3><table><tr><th>路径</th><th>说明</th></tr>";
-      problems.forEach(p => h += "<tr><td>"+esc(p.Action.RelPath||p.Action.RemotePath)+"</td><td>"
-        + esc(p.Error||p.Detail||"")+"</td></tr>");
-      h += "</table>";
+    const j=await post("/api/apply",{removalMode:"recycle",confirmRemoval:true,acknowledgeRecycle:true,acknowledgeBlast:document.getElementById("ackBlast").checked,maxRemovePercent:10,maxRemoveBytes:10*1024*1024*1024});
+    if(!j.ok){if(j.remainingReport)renderPlan(j.remainingReport);show("applyOut",'<div class="banner warn">'+esc(j.error)+'</div>');return;}
+    const r=j.report,renames=r.renames||[],removes=r.removes||[];
+    let h="<div class='tally'><div><b>"+renames.filter(x=>x.OK).length+"</b>重命名成功</div>"
+      +"<div><b>"+(removes.filter(x=>x.OK).length+renames.filter(x=>x.TargetRemoved).length)+"</b>清理成功（项）</div>"
+      +"<div><b>"+r.failures+"</b>未完成 / 跳过</div></div>";
+    h+="<div class='hint'>"+esc(r.startedAt)+" → "+esc(r.finishedAt)+"；等待官方备份 "+r.pendingCount+" 项。</div>";
+    if(r.removalSkipped)h+='<div class="banner warn">'+esc(r.removalReason)+'</div>';
+    if(r.aborted)h+='<div class="banner warn">'+esc(r.abortReason)+'</div>';
+    const problems=[...renames,...removes].filter(x=>!x.OK);
+    if(problems.length){h+="<div class='table-wrap'><table><tr><th>未完成项</th><th>说明</th></tr>";problems.forEach(p=>h+="<tr><td>"+esc(p.Action.RelPath)+"</td><td>"+esc(p.Error||p.Detail)+"</td></tr>");h+="</table></div>";}
+    if(r.recoverySteps?.length)h+="<div class='hint'>"+r.recoverySteps.map(esc).join("<br>")+"</div>";
+    if(j.remainingReport){
+      renderPlan(j.remainingReport);
+      h+='<div class="banner warn">其他独立项已处理。现在可仅重试未完成项，无需重新全盘扫描；重试前仍会逐项复核。</div>';
+    }else{
+      h+='<div class="banner">本次可执行项已完成。等待备份和需判断项仍保留；不会上传或创建目录。</div>';
+      document.getElementById("applyReady").classList.add("hidden");
+      document.getElementById("applyBlocked").textContent="本次可执行项已完成。新的云端变化需要重新预览后才会处理。";
     }
-    if(r.recoverySteps && r.recoverySteps.length){
-      h += "<h3 style='font-size:14px'>恢复 / 后续</h3><ul style='margin:0;padding-left:20px'>";
-      r.recoverySteps.forEach(s => h += "<li>"+esc(s)+"</li>");
-      h += "</ul>";
-    }
-    h += r.succeeded ? "<div class='banner'><b>完成</b> — 请再点一次「预览差异」确认零差异。</div>"
-                     : "<div class='banner warn'>存在未完成项，请查看上方清单并按提示重试。</div>";
-    if(j.savedTo) h += '<div class="hint">执行记录已保存: '+esc(j.savedTo)+'</div>';
-    show("applyOut", h);
-    // The plan is spent; force a fresh preview before another apply.
-    document.getElementById("applyReady").classList.add("hidden");
-    document.getElementById("applyBlocked").classList.remove("hidden");
-    document.getElementById("applyBlocked").textContent = "执行已完成。请重新「预览差异」后再决定是否再次执行。";
-  } catch(e){
-    show("applyOut", '<div class="banner warn">结果显示失败，请查看日志和执行记录，并重新预览差异。'+esc(e.message)+'</div>');
-  } finally { busy(btn, false); refreshLog(); }
+    if(j.savedTo)h+='<div class="hint">执行记录：'+esc(j.savedTo)+'</div>';
+    show("applyOut",h);
+  }finally{
+    busy(btn,false);
+    document.getElementById("btnApply").textContent=currentPlan?"仅重试未完成项":"执行整理";
+    updateCleanupOptions();refreshLog();
+  }
 };
 
-// ---------- log ----------
+// ---------- progress and log ----------
+const phaseLabels={rename:"重命名云端版本",starting:"准备开始",local:"扫描本地",cloud:"扫描云端",hash:"核对文件内容",
+  verify:"核验写入结果",remove:"清理云端多余项",planned:"预览完成",recheck:"执行前复核","recheck-remove":"清理前复核"};
+function renderProgress(p){
+  if(!p || !p.startedAt) return;
+  document.getElementById("operationProgress").classList.remove("hidden");
+  const title=document.getElementById("progressTitle"),bar=document.getElementById("progressBar");
+  bar.classList.toggle("hidden",!p.running && p.status!=="complete");
+  title.textContent=p.running?(phaseLabels[p.phase]||"处理中"):
+    p.status==="error"?"操作失败，请查看日志":p.status==="warning"?"操作结束，存在未完成项":"操作完成";
+  if(p.running) document.getElementById("progressElapsed").textContent="已用时 "+Math.max(0,Math.floor((Date.now()-p.startedAt)/1000))+" 秒";
+  const bytePhase=p.phase==="transfer" || p.phase==="hash-upload";
+  let info=[];
+  if(p.total>0){
+    const done=bytePhase?(p.bytes||0):p.done;
+    bar.value=Math.min(100,Math.max(0,done/p.total*100));
+    info.push(bytePhase?"当前文件 "+size(done)+" / "+size(p.total):"当前阶段 "+done+" / "+p.total+" 项");
+  }else{bar.removeAttribute("value");if(p.running)info.push("正在统计，总量尚未确定");}
+  if(!p.running){if(p.status==="complete")bar.value=100;else bar.removeAttribute("value");}
+  if(p.files || p.dirs) info.push("已发现 "+(p.files||0)+" 文件、"+(p.dirs||0)+" 目录");
+  if(p.bytes && !bytePhase)info.push((p.phase==="hash"?"已读取 ":"已统计 ")+size(p.bytes));
+  if(p.current)info.push(p.current);
+  document.getElementById("progressMeta").textContent=info.join(" · ");
+}
+let logFetching=false;
 async function refreshLog(){
+  if(logFetching)return;logFetching=true;
   try{
     const j = await request("/api/log");
     if(j.ok){
       const el = document.getElementById("log");
+      const follow=el.scrollTop+el.clientHeight>=el.scrollHeight-30;
       el.textContent = j.lines.length ? j.lines.join("\n") : "（暂无日志）";
-      el.scrollTop = el.scrollHeight;
+      if(follow)el.scrollTop = el.scrollHeight;
+      const live=document.getElementById("liveLog");live.textContent=j.lines.slice(-6).join("\n");live.scrollTop=live.scrollHeight;
+      renderProgress(j.progress);
     }
-  }catch(e){}
+  }catch(e){
+    if(busyControls.length){document.getElementById("progressMeta").textContent="进度连接暂时中断，正在重连；请保留启动窗口并等待操作结果。";}
+  }finally{logFetching=false;}
 }
 document.getElementById("btnLog").onclick = refreshLog;
 document.getElementById("btnQuit").onclick = async () => {
@@ -701,7 +620,7 @@ document.getElementById("btnQuit").onclick = async () => {
 
 refreshAccount();
 refreshLog();
-setInterval(refreshLog, 4000);
+setInterval(refreshLog, 800);
 </script>
 </body>
 </html>

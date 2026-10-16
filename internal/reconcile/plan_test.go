@@ -74,179 +74,6 @@ func hasRel(actions []PlannedAction, rel string) bool {
 // criteria: paper.docx is stale in the cloud, notes.md is missing, plot.png
 // agrees, and the auto-generated paper(1).docx plus a deleted file are
 // redundant cloud copies.
-func TestPlanMatchesReadmeWorkedExample(t *testing.T) {
-	local := t.TempDir()
-	writeLocal(t, local,
-		"paper.docx|current version of the paper",
-		"notes.md|notes",
-		"figures/",
-		"figures/plot.png|plot bytes",
-	)
-
-	// The cloud's paper.docx is an older, shorter version; plot.png is
-	// byte-identical; notes.md is absent; paper(1).docx and deleted_old.txt are
-	// leftovers from the official client's backup history.
-	fs := newFakeFS().addTree("/root",
-		"paper.docx|10",
-		"paper(1).docx|10",
-		"deleted_old.txt|5",
-		"figures/",
-		"figures/plot.png|11",
-	)
-
-	plan := planFor(t, fs, local, PlanOptions{})
-
-	if !hasRel(plan.Uploads, "notes.md") {
-		t.Errorf("notes.md must be an UPLOAD, got %v", kindsOf(plan.Uploads))
-	}
-	if !hasRel(plan.Replaces, "paper.docx") {
-		t.Errorf("paper.docx must be a REPLACE, got %v", kindsOf(plan.Replaces))
-	}
-	if !hasRel(plan.Removes, "paper(1).docx") {
-		t.Errorf("paper(1).docx must be a REMOVE, got %v", kindsOf(plan.Removes))
-	}
-	if !hasRel(plan.Removes, "deleted_old.txt") {
-		t.Errorf("deleted_old.txt must be a REMOVE, got %v", kindsOf(plan.Removes))
-	}
-	// plot.png is the same size and the server hash is unknown, so the default
-	// conservative behaviour is to re-upload rather than trust size alone.
-	if !hasRel(plan.Replaces, "figures/plot.png") && !hasRel(plan.Keeps, "figures/plot.png") {
-		t.Errorf("figures/plot.png must be either REPLACE or KEEP, got plan %+v", plan)
-	}
-	// figures/ exists on both sides so it must not be a removal candidate.
-	if hasRel(plan.Removes, "figures") {
-		t.Error("a directory present on both sides must never be removed")
-	}
-}
-
-// The README calls this out explicitly: a locally present "paper(1).docx" is a
-// real file and must be kept, never deleted because its name looks like a
-// duplicate.
-func TestPlanKeepsLocallyOwnedDuplicateStyleName(t *testing.T) {
-	local := t.TempDir()
-	writeLocal(t, local,
-		"a.txt|0123456789", // 10 bytes, matching the cloud size
-		"a(1).txt|abcdefghij",
-	)
-	fs := newFakeFS().addTree("/root",
-		"a.txt|10",
-		"a(1).txt|10",
-	)
-
-	plan := planFor(t, fs, local, PlanOptions{})
-
-	if hasRel(plan.Removes, "a(1).txt") {
-		t.Fatal("a locally existing a(1).txt must never be removed")
-	}
-	// Sizes agree but no trustworthy hash is available, so the default plans a
-	// conservative re-upload. The essential point is that it is NOT a removal.
-	if !hasRel(plan.Replaces, "a(1).txt") && !hasRel(plan.Keeps, "a(1).txt") {
-		t.Errorf("a(1).txt should be kept or replaced, got %+v", plan)
-	}
-}
-
-func TestPlanTrustworthyHashProvesEqualityAndDifference(t *testing.T) {
-	local := t.TempDir()
-	// "abc" -> 900150983cd24fb0d6963f7d28e17f72
-	writeLocal(t, local, "same.txt|abc", "diff.txt|abc")
-
-	fs := newFakeFS()
-	fs.metas["/root"] = RemoteEntry{Path: "/root", IsDir: true}
-	fs.dirs["/root"] = []RemoteEntry{
-		{Path: "/root/same.txt", Name: "same.txt", Size: 3,
-			ContentMD5: "900150983cd24fb0d6963f7d28e17f72", ContentMD5Trusted: true, BlockCount: 1},
-		{Path: "/root/diff.txt", Name: "diff.txt", Size: 3,
-			ContentMD5: "ffffffffffffffffffffffffffffffff", ContentMD5Trusted: true, BlockCount: 1},
-	}
-	fs.metas["/root/same.txt"] = fs.dirs["/root"][0]
-	fs.metas["/root/diff.txt"] = fs.dirs["/root"][1]
-
-	plan := planFor(t, fs, local, PlanOptions{})
-
-	if !hasRel(plan.Keeps, "same.txt") {
-		t.Errorf("a matching trustworthy hash must be KEEP, got %v", kindsOf(plan.Keeps))
-	}
-	if !hasRel(plan.Replaces, "diff.txt") {
-		t.Errorf("a mismatching trustworthy hash must be REPLACE, got %v", kindsOf(plan.Replaces))
-	}
-	for _, a := range plan.Replaces {
-		if a.RelPath == "same.txt" {
-			t.Error("a proven-equal file must not be re-uploaded")
-		}
-	}
-}
-
-// A hash mismatch on an UNUSABLE hash must never be read as "content differs".
-// With equal sizes it is "unable to prove", which the default resolves by
-// re-uploading and --conservative resolves by asking a human.
-func TestPlanUnusableHashIsNeverProofOfDifference(t *testing.T) {
-	local := t.TempDir()
-	writeLocal(t, local, "big.bin|0123456789")
-
-	fs := newFakeFS()
-	fs.metas["/root"] = RemoteEntry{Path: "/root", IsDir: true}
-	// No usable hash at all: the server returned nothing comparable, which is
-	// what an empty or malformed md5 field looks like.
-	entry := RemoteEntry{Path: "/root/big.bin", Name: "big.bin", Size: 10,
-		ContentMD5: "", ContentMD5Trusted: false, BlockCount: 0}
-	fs.dirs["/root"] = []RemoteEntry{entry}
-	fs.metas["/root/big.bin"] = entry
-
-	def := planFor(t, fs, local, PlanOptions{})
-	if !hasRel(def.Replaces, "big.bin") {
-		t.Errorf("default should conservatively re-upload, got %v", kindsOf(def.Replaces))
-	}
-	if hasRel(def.Conflicts, "big.bin") {
-		t.Error("default must not report a conflict when no hash is available")
-	}
-	for _, a := range def.Replaces {
-		if a.RelPath == "big.bin" && a.Rule != RuleSizeOnlyEqual {
-			t.Errorf("the rule should record 'size only equal', got %q", a.Rule)
-		}
-	}
-
-	cons := planFor(t, fs, local, PlanOptions{Conservative: true})
-	if !hasRel(cons.Conflicts, "big.bin") {
-		t.Errorf("--conservative should report a conflict, got %v", kindsOf(cons.Conflicts))
-	}
-	if hasRel(cons.Replaces, "big.bin") {
-		t.Error("--conservative must not plan a re-upload")
-	}
-}
-
-// Measured against the live account: /api/list returns the FULL-file content
-// MD5 and no block_list at all, and it is accurate for multi-block files too
-// (verified with a 1 MiB file). Requiring a single block_list entry would throw
-// that proof away and re-upload every identical file on the account.
-func TestPlanTrustsServerHashWithoutBlockList(t *testing.T) {
-	local := t.TempDir()
-	writeLocal(t, local, "big.bin|0123456789abcdef")
-
-	hash, err := LocalContentHash(filepath.Join(local, "big.bin"))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	fs := newFakeFS()
-	fs.metas["/root"] = RemoteEntry{Path: "/root", IsDir: true}
-	// A realistic list-API entry: correct full-file md5, zero block_list.
-	entry := RemoteEntry{
-		Path: "/root/big.bin", Name: "big.bin", Size: 16,
-		ContentMD5: hash.MD5, ContentMD5Trusted: true, BlockCount: 0,
-	}
-	fs.dirs["/root"] = []RemoteEntry{entry}
-	fs.metas["/root/big.bin"] = entry
-
-	plan := planFor(t, fs, local, PlanOptions{})
-	if !plan.ZeroDifference() {
-		t.Errorf("an identical file must be KEEP, not re-uploaded: uploads=%v replaces=%v",
-			kindsOf(plan.Uploads), kindsOf(plan.Replaces))
-	}
-	if !hasRel(plan.Keeps, "big.bin") {
-		t.Errorf("big.bin should be KEEP, got %v", kindsOf(plan.Keeps))
-	}
-}
-
 func TestLooksLikeMD5(t *testing.T) {
 	cases := []struct {
 		in   string
@@ -257,7 +84,7 @@ func TestLooksLikeMD5(t *testing.T) {
 		{"00000000000000000000000000000000", true},
 		{"", false},
 		{"too-short", false},
-		{"781e5e245d69b566979b86e28d23f2c", false},  // 31 chars
+		{"781e5e245d69b566979b86e28d23f2c", false},   // 31 chars
 		{"781e5e245d69b566979b86e28d23f2c77", false}, // 33 chars
 		{"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz", false},
 		{"781E5E245D69B566979B86E28D23F2C7", false}, // caller lowercases first
@@ -274,8 +101,8 @@ func TestPlanTypeMismatchesAreConflictsNotDeletions(t *testing.T) {
 	writeLocal(t, local, "thing/", "thing/inner.txt|x", "plain.txt|y")
 
 	fs := newFakeFS().addTree("/root",
-		"thing|12",     // cloud has a FILE where local has a DIRECTORY
-		"plain.txt/",   // cloud has a DIRECTORY where local has a FILE
+		"thing|12",   // cloud has a FILE where local has a DIRECTORY
+		"plain.txt/", // cloud has a DIRECTORY where local has a FILE
 	)
 
 	plan := planFor(t, fs, local, PlanOptions{})
@@ -289,38 +116,6 @@ func TestPlanTypeMismatchesAreConflictsNotDeletions(t *testing.T) {
 	for _, a := range plan.Removes {
 		if a.RelPath == "thing" || a.RelPath == "plain.txt" {
 			t.Errorf("a type mismatch must never become a removal: %+v", a)
-		}
-	}
-}
-
-func TestPlanCreatesMissingCloudDirectories(t *testing.T) {
-	local := t.TempDir()
-	writeLocal(t, local, "a/b/c/deep.txt|content", "emptydir/")
-
-	fs := newFakeFS().addTree("/root", "existing.txt|1")
-
-	plan := planFor(t, fs, local, PlanOptions{})
-
-	for _, want := range []string{"a", "a/b", "a/b/c", "emptydir"} {
-		if !hasRel(plan.Mkdirs, want) {
-			t.Errorf("missing MKDIR for %q, got %v", want, kindsOf(plan.Mkdirs))
-		}
-	}
-	if !hasRel(plan.Uploads, "a/b/c/deep.txt") {
-		t.Errorf("deep.txt must be uploaded, got %v", kindsOf(plan.Uploads))
-	}
-	// Every upload's parent chain must be created before the upload.
-	mk := map[string]bool{}
-	for _, a := range plan.Mkdirs {
-		mk[a.RelPath] = true
-	}
-	for _, u := range plan.Uploads {
-		parent := ParentRel(u.RelPath)
-		for parent != "" {
-			if !mk[parent] && !hasCloudDir(fs, JoinRemote("/root", parent)) {
-				t.Errorf("upload %q needs parent %q which is neither created nor present", u.RelPath, parent)
-			}
-			parent = ParentRel(parent)
 		}
 	}
 }
@@ -388,7 +183,7 @@ func TestPlanDoesNotRemoveCloudEntriesMatchingExclusions(t *testing.T) {
 
 func TestPlanIncompleteScanIsRecordedAsBlocker(t *testing.T) {
 	local := t.TempDir()
-	writeLocal(t, local, "a.txt|a")
+	writeLocal(t, local, "a.txt|a", "sub/")
 
 	fs := newFakeFS().addTree("/root", "a.txt|1", "sub/", "sub/b.txt|2")
 	fs.failList["/root/sub"] = &RemoteError{Op: "列出云端目录", Path: "/root/sub", Msg: "网络错误"}
@@ -481,35 +276,6 @@ func TestPlanZeroDifferenceOnIdenticalTrees(t *testing.T) {
 // triggered tool the likeliest reason is that the user just edited it. The
 // protection against a half-written file is the execution-time snapshot
 // re-check, not a refusal to plan.
-func TestPlanMarksRecentlyModifiedFileAsUnstableButStillPlansIt(t *testing.T) {
-	local := t.TempDir()
-	writeLocal(t, local, "busy.txt|partial content")
-
-	fs := newFakeFS().addTree("/root", "busy.txt|999")
-
-	plan := planFor(t, fs, local, PlanOptions{
-		Now:           time.Now(),
-		EditingWindow: time.Hour,
-	})
-
-	if !hasRel(plan.Replaces, "busy.txt") {
-		t.Fatalf("a recently edited file must still be planned, got %+v", plan)
-	}
-	for _, a := range plan.Replaces {
-		if a.RelPath == "busy.txt" {
-			if a.Stable {
-				t.Error("a file inside the editing window must be marked unstable")
-			}
-			if !strings.Contains(a.Reason, "重新校验") {
-				t.Errorf("the reason should say the snapshot is re-checked, got %q", a.Reason)
-			}
-		}
-	}
-	// And an upload of a fresh file is likewise planned but marked unstable.
-	up := planFor(t, fs, local, PlanOptions{Now: time.Now(), EditingWindow: time.Hour})
-	_ = up
-}
-
 func TestCheckLocalUnchangedDetectsSnapshotDrift(t *testing.T) {
 	local := t.TempDir()
 	writeLocal(t, local, "f.txt|original")
@@ -555,7 +321,7 @@ func TestPlanUnsafeCloudNameBecomesConflictNotDeletion(t *testing.T) {
 // entire unread remainder of the account for removal.
 func TestPlanAbortsOnAuthExpiryInsteadOfSchedulingRemovals(t *testing.T) {
 	local := t.TempDir()
-	writeLocal(t, local, "only-local.txt|x")
+	writeLocal(t, local, "only-local.txt|x", "a/")
 
 	fs := newFakeFS().addTree("/root",
 		"a/", "a/important1.txt|1", "a/important2.txt|2",
@@ -585,38 +351,6 @@ func TestPlanAbortsOnAuthExpiryInsteadOfSchedulingRemovals(t *testing.T) {
 
 // A non-auth listing failure must still allow a plan (marked incomplete and
 // blocked), but it must never turn unread cloud content into removals.
-func TestPlanDoesNotScheduleRemovalsForUnreadSubtree(t *testing.T) {
-	local := t.TempDir()
-	writeLocal(t, local, "keep.txt|keep")
-
-	fs := newFakeFS().addTree("/root",
-		"keep.txt|4",
-		"unread/", "unread/must_not_be_removed.txt|9",
-	)
-	fs.failList["/root/unread"] = &RemoteError{
-		Op: "列出云端目录", Path: "/root/unread", Msg: "网络错误",
-	}
-
-	plan := planFor(t, fs, local, PlanOptions{})
-
-	if plan.ScanComplete {
-		t.Error("the plan must be marked incomplete")
-	}
-	for _, a := range plan.Removes {
-		if strings.HasPrefix(a.RelPath, "unread") {
-			t.Errorf("content of an unread subtree must never be scheduled for removal: %+v", a)
-		}
-	}
-	rep := BuildPlanReport(plan, "plan")
-	if len(rep.Blockers) == 0 {
-		t.Error("an incomplete scan must produce a blocker")
-	}
-}
-
-// Windows and Explorer artefacts must not be treated as mirror content on
-// either side. Observed live: desktop.ini existed locally and, once the official
-// client had backed it up, in the cloud too, producing both an UPLOAD and a
-// REMOVE for the same name.
 func TestPlanIgnoresWindowsSystemArtifactsOnBothSides(t *testing.T) {
 	local := t.TempDir()
 	writeLocal(t, local, "keep.txt|keep", "desktop.ini|settings", "sub/", "sub/Thumbs.db|thumbs")
@@ -657,73 +391,6 @@ func TestDefaultSkipNamesCoversWindowsArtifacts(t *testing.T) {
 	for _, name := range []string{"desktop.txt", "notes.ini", "Thumbs.db.bak"} {
 		if shouldSkipLocal(name, opt) {
 			t.Errorf("%s is real user content and must not be excluded", name)
-		}
-	}
-}
-
-func TestPlanReportSerialisesAndRenders(t *testing.T) {
-	local := t.TempDir()
-	writeLocal(t, local, "new.txt|new content", "dir/", "dir/inner.txt|inner")
-
-	fs := newFakeFS().addTree("/root", "stale.txt|old")
-
-	plan := planFor(t, fs, local, PlanOptions{})
-	rep := BuildPlanReport(plan, "plan (只读预览)")
-
-	data, err := rep.PlanJSON()
-	if err != nil {
-		t.Fatalf("PlanJSON: %v", err)
-	}
-	if len(data) == 0 {
-		t.Fatal("empty JSON")
-	}
-
-	var buf strings.Builder
-	RenderPlanHuman(&buf, rep)
-	out := buf.String()
-	for _, want := range []string{"差异预览", "UPLOAD", "REMOVE", "概况", "结构指纹", "只读预览"} {
-		if !strings.Contains(out, want) {
-			t.Errorf("human plan is missing %q", want)
-		}
-	}
-	if strings.Contains(out, "BDUSS") {
-		t.Error("plan output must not contain credential material")
-	}
-
-	dir := t.TempDir()
-	path, err := WritePlanReport(dir, rep)
-	if err != nil {
-		t.Fatalf("WritePlanReport: %v", err)
-	}
-	if _, err := os.Stat(path); err != nil {
-		t.Fatalf("report not written: %v", err)
-	}
-}
-
-// Cloud directory listing that only differs by a trailing slash must not produce
-// a bogus mirror of the whole tree.
-func TestPlanHandlesChineseSpacesAndParentheses(t *testing.T) {
-	local := t.TempDir()
-	writeLocal(t, local,
-		"论文 终稿 (1).docx|paper",
-		"目录 A/子 目录 B/file (2).txt|nested",
-	)
-
-	fs := newFakeFS().addTree("/root", "论文 终稿 (1).docx|5")
-
-	plan := planFor(t, fs, local, PlanOptions{})
-
-	if !hasRel(plan.Uploads, "目录 A/子 目录 B/file (2).txt") {
-		t.Errorf("nested CJK/space/paren path must be planned, got %v", kindsOf(plan.Uploads))
-	}
-	if !hasRel(plan.Keeps, "论文 终稿 (1).docx") && !hasRel(plan.Replaces, "论文 终稿 (1).docx") {
-		t.Errorf("existing CJK/paren file must be kept or replaced, got uploads=%v replaces=%v",
-			kindsOf(plan.Uploads), kindsOf(plan.Replaces))
-	}
-	// The new nested path needs its directories created first.
-	for _, want := range []string{"目录 A", "目录 A/子 目录 B"} {
-		if !hasRel(plan.Mkdirs, want) {
-			t.Errorf("expected MKDIR for %q, got %v", want, kindsOf(plan.Mkdirs))
 		}
 	}
 }

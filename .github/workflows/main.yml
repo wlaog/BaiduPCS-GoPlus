@@ -19,6 +19,6 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Test reconciliation, GUI, and upload changes
-        run: go test -count=1 ./internal/reconcile/... ./internal/pcscommand ./internal/pcsfunctions/pcsupload
+        run: go test -count=1 ./internal/reconcile/... ./internal/pcscommand ./internal/pcsfunctions/pcsupload ./baidupcs
       - name: Build all packages
         run: go build ./...

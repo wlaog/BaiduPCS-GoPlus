@@ -8,6 +8,12 @@ import (
 
 func noSleep(time.Duration) {}
 
+func TestConfirmedMissingPathIsNotRetried(t *testing.T){
+	calls:=0
+	_,attempts,_:=withRetry(DefaultRetryPolicy(),noSleep,nil,func()error{calls++;return &NotFoundError{Path:"/missing"}})
+	if attempts!=1||calls!=1{t.Fatal("normal absence must not trigger backoff on every delete or rename")}
+}
+
 func TestRetrySucceedsAfterTransientFailures(t *testing.T) {
 	calls := 0
 	err, attempts, exhausted := withRetry(DefaultRetryPolicy(), noSleep, nil, func() error {

@@ -8,12 +8,18 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"unicode"
 )
 
 // ScanLimits bounds a remote enumeration so a runaway or unexpectedly huge
 // backup tree cannot turn a probe into an unbounded walk.
 type ScanLimits struct {
+	Workers  int
+	Progress ProgressFunc
+	// PruneDir deliberately treats selected directories as opaque units. Only
+	// cleanup planning uses this; probes still enumerate the entire tree.
+	PruneDir func(RemoteEntry) bool
 	// MaxEntries caps the total number of entries recorded. Zero means the
 	// default (200000).
 	MaxEntries int
@@ -70,10 +76,8 @@ type ScanStats struct {
 	MaxDepth int
 	// ListingRequests counts cloud list calls made.
 	ListingRequests int
-	// LargeDirs lists directories whose child count reached the upstream
-	// pagination page size (1000). Upstream FilesDirectoriesList silently
-	// returns partial data when pagination goes wrong, so a directory this
-	// large is flagged for manual confirmation rather than trusted blindly.
+	// LargeDirs lists directories spanning at least one full page (1000).
+	// This is informational; the adapter returns pagination faults as errors.
 	LargeDirs map[string]int
 	// Errors records subtrees that could not be enumerated. Any entry here is
 	// fatal for planning: an unreadable subtree must never look "empty".
@@ -83,7 +87,7 @@ type ScanStats struct {
 	// it wrong, so it is informational rather than fatal.
 	DepthBounded []string
 	// Truncated reports that a scan limit stopped enumeration early.
-	Truncated bool
+	Truncated   bool
 	TruncatedAt string
 	// AuthFailed reports that the session became invalid mid-scan. When set,
 	// the scan is not merely incomplete: nothing after that point was verified.
@@ -105,7 +109,8 @@ const PanicPageSize = 1000
 // CloudScan is a full enumeration of the cloud root plus the integrity signals
 // needed to decide whether that enumeration can be trusted.
 type CloudScan struct {
-	Root string
+	Root       string
+	PrunedDirs map[string]bool
 	// Entries are all descendants of Root, keyed by cloud path. Root itself is
 	// not included.
 	Entries map[string]RemoteEntry
@@ -194,6 +199,7 @@ func ScanCloud(r Reader, root string, limits ScanLimits) (*CloudScan, error) {
 
 	scan := &CloudScan{
 		Root:        root,
+		PrunedDirs:  make(map[string]bool),
 		Entries:     make(map[string]RemoteEntry),
 		Dirs:        make(map[string]bool),
 		UnsafeNames: make(map[string]string),
@@ -203,6 +209,7 @@ func ScanCloud(r Reader, root string, limits ScanLimits) (*CloudScan, error) {
 	// Confirm the root exists and is a directory before walking it. Without
 	// this, a typo in --remote would produce an empty scan that looks like
 	// "the cloud copy is empty, upload everything".
+	limits.Progress.emit(Progress{Phase: "cloud", Current: root})
 	meta, err := r.Meta(root)
 	if err != nil {
 		if IsNotFound(err) {
@@ -219,10 +226,54 @@ func ScanCloud(r Reader, root string, limits ScanLimits) (*CloudScan, error) {
 		depth int
 	}
 	queue := []queueItem{{path: root, depth: 0}}
+	type listed struct {
+		entries []RemoteEntry
+		err     error
+	}
+	prefetched := make(map[string]listed)
+	workers := limits.Workers
+	if workers <= 0 {
+		workers = 1
+	}
+	if workers > 4 {
+		workers = 4
+	}
 
 	for len(queue) > 0 {
+		if len(prefetched) == 0 {
+			n := workers
+			if n > len(queue) {
+				n = len(queue)
+			}
+			results := make([]listed, n)
+			var wg sync.WaitGroup
+			for i := 0; i < n; i++ {
+				if queue[i].depth >= limits.MaxDepth {
+					continue
+				}
+				scan.Stats.ListingRequests++
+				wg.Add(1)
+				go func(i int, p string) {
+					defer wg.Done()
+					defer func() {
+						if recover() != nil {
+							results[i].err = fmt.Errorf("目录扫描异常中止")
+						}
+					}()
+					results[i].entries, results[i].err = r.ListDir(p)
+				}(i, queue[i].path)
+			}
+			limits.Progress.emit(Progress{Phase: "cloud", Current: queue[0].path, Files: scan.Stats.FileCount, Dirs: scan.Stats.DirCount, Bytes: scan.Stats.TotalBytes})
+			wg.Wait()
+			for i := 0; i < n; i++ {
+				prefetched[queue[i].path] = results[i]
+			}
+		}
 		cur := queue[0]
 		queue = queue[1:]
+		result := prefetched[cur.path]
+		delete(prefetched, cur.path)
+		limits.Progress.emit(Progress{Phase: "cloud", Current: cur.path, Done: int64(scan.Stats.ListingRequests), Files: scan.Stats.FileCount, Dirs: scan.Stats.DirCount, Bytes: scan.Stats.TotalBytes})
 
 		if cur.depth >= limits.MaxDepth {
 			// Distinguish "the caller asked to stop here" from "the safety
@@ -247,8 +298,7 @@ func ScanCloud(r Reader, root string, limits ScanLimits) (*CloudScan, error) {
 			continue
 		}
 
-		scan.Stats.ListingRequests++
-		children, listErr := r.ListDir(cur.path)
+		children, listErr := result.entries, result.err
 		if listErr != nil {
 			// An authentication failure is not a local gap: the session died and
 			// every subsequent listing would fail too. Continuing would record
@@ -296,6 +346,10 @@ func ScanCloud(r Reader, root string, limits ScanLimits) (*CloudScan, error) {
 				})
 				continue
 			}
+			if ParentRemote(child.Path) != cur.path || child.Name != path.Base(child.Path) {
+				scan.Stats.Errors = append(scan.Stats.Errors, ScanError{Path: cur.path, Err: "云端条目路径越界或名称不一致"})
+				continue
+			}
 
 			scan.Entries[child.Path] = child
 			scan.Order = append(scan.Order, child.Path)
@@ -313,7 +367,11 @@ func ScanCloud(r Reader, root string, limits ScanLimits) (*CloudScan, error) {
 				if cur.depth+1 > scan.Stats.MaxDepth {
 					scan.Stats.MaxDepth = cur.depth + 1
 				}
-				queue = append(queue, queueItem{path: child.Path, depth: cur.depth + 1})
+				if limits.PruneDir != nil && limits.PruneDir(child) {
+					scan.PrunedDirs[child.Path] = true
+				} else {
+					queue = append(queue, queueItem{path: child.Path, depth: cur.depth + 1})
+				}
 			} else {
 				scan.Stats.FileCount++
 				scan.Stats.TotalBytes += child.Size

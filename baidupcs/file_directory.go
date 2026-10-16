@@ -206,11 +206,20 @@ type fdPanListJSON struct {
 // (修复 https://github.com/qjfoidnh/BaiduPCS-Go/issues/511)。
 // 通过 fs_id 去重防御分页异常: 一旦出现重复条目立即终止, 避免死循环与重复数据。
 func (pcs *BaiduPCS) FilesDirectoriesList(path string, options *OrderOptions) (data FileDirectoryList, pcsError pcserror.Error) {
+	return pcs.FilesDirectoriesListWithPacing(path, options, nil)
+}
+
+// FilesDirectoriesListWithPacing allows callers to limit every page request,
+// including retries of a multi-page directory. Existing callers are unchanged.
+func (pcs *BaiduPCS) FilesDirectoriesListWithPacing(path string, options *OrderOptions, beforePage func()) (data FileDirectoryList, pcsError pcserror.Error) {
 	// 防御性上限, 避免接口异常导致死循环
 	const maxPage = 2000
 	seen := make(map[int64]struct{}, maxListNum)
 
 	for page := 1; page <= maxPage; page++ {
+		if beforePage != nil {
+			beforePage()
+		}
 		dataReadCloser, err := pcs.PrepareFilesDirectoriesList(path, options, maxListNum, page)
 		if err != nil {
 			pcsError = err
@@ -236,7 +245,8 @@ func (pcs *BaiduPCS) FilesDirectoriesList(path string, options *OrderOptions) (d
 		pageList := make(FileDirectoryList, 0, len(jsonData.List))
 		for _, j := range jsonData.List {
 			if _, ok := seen[j.FsID]; ok {
-				// 重复 fs_id 说明分页未继续推进 (或已绕回), 终止遍历
+				pcsError = pcserror.NewPanErrorInfo(OperationFilesDirectoriesList)
+				pcsError.SetJSONError(fmt.Errorf("目录分页返回重复 fs_id，目录可能在扫描期间变化，请重试"))
 				return
 			}
 			seen[j.FsID] = struct{}{}
@@ -248,6 +258,11 @@ func (pcs *BaiduPCS) FilesDirectoriesList(path string, options *OrderOptions) (d
 
 		if len(jsonData.List) < maxListNum {
 			break // 已取完最后一页
+		}
+		if page == maxPage {
+			pcsError = pcserror.NewPanErrorInfo(OperationFilesDirectoriesList)
+			pcsError.SetJSONError(fmt.Errorf("目录分页超过安全上限，未完整枚举"))
+			return
 		}
 	}
 	return

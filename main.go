@@ -1345,33 +1345,12 @@ func main() {
 					},
 				},
 				{
-					Name:      "plan",
-					Usage:     "预览差异计划 (只读, 不改变云端任何内容)",
-					UsageText: app.Name + " reconcile plan --local <本地目录> --remote <云端目录> [--hash]",
-					Description: `
-	只读预览: 扫描本地与云端目录, 列出四类差异, 不改变任何内容。
-
-	  UPLOAD   云端缺失, 需要上传
-	  REPLACE  同路径且内容不同, 需要覆盖
-	  REMOVE   云端多余 (本地已不存在), 待清理
-	  KEEP     经可靠规则确认一致
-	  CONFLICT 类型不符/名称不可映射/正在编辑/哈希不可判 — 需人工判断, 不会自动处理
-
-	判定规则要点:
-	  哈希相同可作为"内容一致"的证据; 哈希不同**不作为**"内容不同"的证据。
-	  服务端 MD5 只在单个 block_list 时可信, 大文件需用 --hash 重新计算比对,
-	  仍无法证明时默认保守地计划重新上传 (可用 --conservative 改为标记冲突)。
-
-	注意: --remote 会同时校验该目录必须存在且必须位于 --remote 之内;
-	本命令为只读, 可以安全地对真实备份目录反复执行。
-
-	示例:
-	  BaiduPCS-Go reconcile plan --local "D:/WorkSync" --remote "/来自：本地电脑/WorkSync"
-	  BaiduPCS-Go reconcile plan --local "D:/WorkSync" --remote "/来自：本地电脑/WorkSync" --hash
-	  BaiduPCS-Go reconcile plan --local "D:/WorkSync" --remote "/来自：本地电脑/WorkSync" --conservative
-`,
-					Category: "百度网盘",
-					Before:   reloadFn,
+					Name:        "plan",
+					Usage:       "预览差异计划 (只读, 不改变云端任何内容)",
+					UsageText:   app.Name + " reconcile plan --local <本地目录> --remote <云端目录> [--hash]",
+					Description: `只读预览云端整理：RENAME 将按内容匹配的备份版本恢复为本地名称；REMOVE 清理本地不存在的内容；KEEP 保留一致项；WAIT 等待官方备份；CONFLICT 跳过相关项。不会上传、覆盖文件内容或创建目录。`,
+					Category:    "百度网盘",
+					Before:      reloadFn,
 					Action: func(c *cli.Context) error {
 						opt := &pcscommand.ReconcilePlanOptions{
 							LocalRoot:    c.String("local"),
@@ -1402,8 +1381,9 @@ func main() {
 							Usage: "计算内容哈希, 把'仅大小相同'升级为可信判等 (有本地读取开销)",
 						},
 						cli.BoolFlag{
-							Name:  "conservative",
-							Usage: "大小相同但哈希不可信时标记为冲突, 而不是计划重新上传",
+							Name:   "conservative",
+							Hidden: true,
+							Usage:  "兼容选项；当前无法确认最新内容时统一等待官方备份",
 						},
 						cli.StringFlag{
 							Name:  "skip-suffixes",
@@ -1424,41 +1404,12 @@ func main() {
 					},
 				},
 				{
-					Name:  "apply",
-					Usage: "执行对齐 (会修改云端; 默认先预览并要求确认)",
-					UsageText: app.Name + " reconcile apply --local <本地目录> --remote <云端目录> [--remove-mode quarantine|recycle]",
-					Description: `
-	执行对齐: 上传缺失文件、覆盖过期文件、把云端多余项移出镜像。
-
-	执行顺序 (安全设计):
-	  1. 创建缺失的云端目录
-	  2. 上传缺失文件 / 覆盖内容不同的文件
-	  3. 重新列举云端, 校验写入确实生效
-	  4. 只有前三步全部成功, 才处理云端多余项
-	任何一步失败都会跳过后续清理 —— 因为云端副本只有在本地对应版本
-	确认上传成功之后, 才算得上"多余"。
-
-	清理方式 (默认隔离区, 不做永久删除):
-	  quarantine  移动到镜像根目录之外的 /BackupReconcile_Quarantine/<时间戳>/
-	              保留原相对路径, 可随时移回; 执行记录里带完整清单
-	  recycle     移入网盘回收站 (保留约 35 天), 需要额外确认
-
-	安全闸门:
-	  * 扫描不完整 -> 直接拒绝执行, 不做任何改动
-	  * 有交互确认: 展示将清理的数量与容量, 输入 yes 才继续
-	  * 阈值保护: 清理超过 --max-remove-percent / --max-remove-bytes
-	    时需要额外确认
-	  * 本地文件在计划生成后发生变化 -> 跳过该文件, 不上传半写入内容
-	  * 移动失败绝不降级为永久删除, 只报告并停止
-
-	幂等: 中断后重新运行是安全的, 已完成的项会被识别为一致。
-
-	示例:
-	  BaiduPCS-Go reconcile apply --local "D:/test" --remote "/来自：本地电脑/test"
-	  BaiduPCS-Go reconcile apply --local "D:/test" --remote "/来自：本地电脑/test" --remove-mode recycle
-`,
-					Category: "百度网盘",
-					Before:   reloadFn,
+					Name:        "apply",
+					Usage:       "执行对齐 (会修改云端; 默认先预览并要求确认)",
+					UsageText:   app.Name + " reconcile apply --local <本地目录> --remote <云端目录> [--remove-mode recycle]",
+					Description: `只执行云端重命名和回收站删除，不上传、不创建目录。按内容匹配版本后再整理历史副本；找不到本地最新内容时等待官方备份。单项失败会记录并继续处理其他独立项，关联正确版本尚未就位时保留其历史副本。扫描不完整、空本地目录及未确认的大批量清理仍会阻止执行。GUI 可保持服务运行，仅重试未完成项而无需重新全盘扫描。`,
+					Category:    "百度网盘",
+					Before:      reloadFn,
 					Action: func(c *cli.Context) error {
 						opt := &pcscommand.ReconcileApplyOptions{
 							ReconcilePlanOptions: pcscommand.ReconcilePlanOptions{
@@ -1470,13 +1421,13 @@ func main() {
 								SkipNames:    c.String("skip-names"),
 								JSONOut:      c.String("json-out"),
 							},
-							RemovalMode:      c.String("remove-mode"),
-							QuarantineRoot:   c.String("quarantine"),
-							ConfirmRemoval:   c.Bool("confirm-removal"),
+							RemovalMode:        c.String("remove-mode"),
+							QuarantineRoot:     c.String("quarantine"),
+							ConfirmRemoval:     c.Bool("confirm-removal"),
 							AcknowledgeRecycle: c.Bool("yes-recycle"),
-							AcknowledgeBlast: c.Bool("yes-large-removal"),
-							MaxRemovePercent: c.Float64("max-remove-percent"),
-							MaxRemoveBytes:   c.Int64("max-remove-bytes"),
+							AcknowledgeBlast:   c.Bool("yes-large-removal"),
+							MaxRemovePercent:   c.Float64("max-remove-percent"),
+							MaxRemoveBytes:     c.Int64("max-remove-bytes"),
 						}
 						if err := pcscommand.RunReconcileApply(opt); err != nil {
 							return cli.NewExitError(err.Error(), 1)
@@ -1494,20 +1445,22 @@ func main() {
 						},
 						cli.StringFlag{
 							Name:  "remove-mode",
-							Usage: "云端多余项的处置方式: quarantine (隔离区, 默认) 或 recycle (回收站)",
-							Value: "quarantine",
+							Usage: "清理方式（当前仅支持 recycle，进入网盘回收站）",
+							Value: "recycle",
 						},
 						cli.StringFlag{
-							Name:  "quarantine",
-							Usage: "隔离区顶层目录 (默认 /BackupReconcile_Quarantine)",
+							Name:   "quarantine",
+							Hidden: true,
+							Usage:  "隔离区顶层目录 (默认 /BackupReconcile_Quarantine)",
 						},
 						cli.BoolFlag{
 							Name:  "hash",
 							Usage: "计算内容哈希以精确判定一致性 (有本地读取开销)",
 						},
 						cli.BoolFlag{
-							Name:  "conservative",
-							Usage: "哈希不可用时标记为冲突而不是重新上传",
+							Name:   "conservative",
+							Hidden: true,
+							Usage:  "兼容选项；无法确认时等待官方备份",
 						},
 						cli.BoolFlag{
 							Name:  "confirm-removal",
@@ -1515,11 +1468,11 @@ func main() {
 						},
 						cli.BoolFlag{
 							Name:  "yes-recycle",
-							Usage: "确认使用回收站方式清理 (隔离区可随时移回, 回收站依赖保留期)",
+							Usage: "确认删除进入网盘回收站，恢复期限以网盘为准",
 						},
 						cli.BoolFlag{
 							Name:  "yes-large-removal",
-							Usage: "确认超过阈值的批量清理",
+							Usage: "确认超过阈值的清理，或未统计内部数量/容量的整目录回收",
 						},
 						cli.Float64Flag{
 							Name:  "max-remove-percent",
@@ -1554,7 +1507,7 @@ func main() {
 
 	  1. 只读探测:  找出云端备份目录, 核对本地与云端
 	  2. 预览差异:  UPLOAD / REPLACE / MKDIR / REMOVE / KEEP / CONFLICT
-	  3. 执行对齐:  上传覆盖后清理云端多余项 (移入隔离区或回收站)
+	  3. 执行对齐:  仅删除云端多余项或重命名正确版本；失败项可单独重试
 
 	界面内已内置完整的操作步骤说明与安全设计说明。
 

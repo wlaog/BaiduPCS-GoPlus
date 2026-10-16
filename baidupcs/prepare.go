@@ -221,7 +221,7 @@ func (pcs *BaiduPCS) PrepareBDStoken() (dataReadCloser io.ReadCloser, pcsError p
 	pcs.lazyInit()
 	pcsURL := pcs.generatePanURL("gettemplatevariable", map[string]string{
 		"clienttype": "0",
-		"app_id":     string(pcs.appID),
+		"app_id":     strconv.Itoa(pcs.appID),
 		"fields":     `["bdstoken"]`,
 	})
 	dataReadCloser, pcsError = pcs.sendReqReturnReadCloser(reqTypePCS, OperationGetBDSToken, http.MethodGet, pcsURL.String(), nil, nil)

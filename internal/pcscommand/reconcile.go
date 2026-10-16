@@ -44,7 +44,7 @@ func reconcileReportDir() string {
 // preview. Planning performs no mutation: it reads both trees and decides what
 // would change, so it is safe to run against a live backup directory.
 type ReconcilePlanOptions struct {
-	LocalRoot string
+	LocalRoot  string
 	RemoteRoot string
 	// HashFiles computes content hashes to upgrade "same size" comparisons into
 	// a proof of equality or difference.
@@ -182,8 +182,8 @@ func RunReconcileApply(opt *ReconcileApplyOptions) error {
 	mode := reconcile.RemovalMode(strings.ToLower(strings.TrimSpace(opt.RemovalMode)))
 	switch mode {
 	case "":
-		mode = reconcile.RemovalQuarantine
-	case reconcile.RemovalQuarantine, reconcile.RemovalRecycle:
+		mode = reconcile.RemovalRecycle
+	case reconcile.RemovalRecycle:
 	default:
 		return fmt.Errorf("未知的清理方式 %q: 可选 %s 或 %s",
 			opt.RemovalMode, reconcile.RemovalQuarantine, reconcile.RemovalRecycle)
@@ -214,34 +214,35 @@ func RunReconcileApply(opt *ReconcileApplyOptions) error {
 		return errors.New("扫描不完整, 已拒绝执行 (不会做任何改动)")
 	}
 	if plan.Changes() == 0 {
-		fmt.Printf("\n零差异: 云端已与本地一致, 无需执行。\n")
+		fmt.Printf("\n本次无可执行整理项；等待官方备份 %d 项，需判断 %d 项。\n", len(plan.Pending), len(plan.Conflicts))
 		return nil
 	}
 
 	// Interactive confirmation, showing what is at stake.
-	if !opt.ConfirmRemoval && len(plan.Removes) > 0 {
-		fmt.Printf("\n本次将清理 %d 项 (%d 文件 / %d 目录), 合计 %s。\n",
-			len(plan.Removes), plan.RemoveFiles(), len(plan.Removes)-plan.RemoveFiles(),
-			converter.ConvertFileSize(plan.RemoveBytes(), 2))
-		if mode == reconcile.RemovalQuarantine {
-			fmt.Printf("它们会被移动到隔离区 (不会永久删除, 可随时移回)。\n")
-		} else {
-			fmt.Printf("它们会被移入网盘回收站 (保留约 35 天)。\n")
-		}
+	if !opt.ConfirmRemoval && plan.Changes() > 0 {
+		fmt.Printf("\n本次将重命名 %d 项、回收 %d 个文件（含同名旧版），合计 %s。\n", len(plan.Renames), plan.RemoveFiles(), converter.ConvertFileSize(plan.RemoveBytes(), 2))
+		fmt.Println("删除进入网盘回收站，恢复期限以网盘为准。")
 		if !promptYes("确认继续? 输入 yes 继续, 其他任意输入取消 > ") {
 			fmt.Printf("已取消, 未做任何改动。\n")
 			return nil
 		}
 		opt.ConfirmRemoval = true
+		if plan.UnscannedRemoveDirs() > 0 {
+			// The preview and prompt explicitly include all contents of these
+			// opaque directories; the interactive answer confirms that scope.
+			opt.AcknowledgeBlast = true
+		}
 		if mode == reconcile.RemovalRecycle {
 			opt.AcknowledgeRecycle = true
 		}
 	}
 
 	writer := reconcile.NewRemoteWriter(pcs)
+
 	executor := &reconcile.Executor{
 		Writer: writer,
-		Log:    func(s string) { fmt.Printf("  %s\n", s) },
+
+		Log: func(s string) { fmt.Printf("  %s\n", s) },
 	}
 
 	fmt.Printf("\n开始执行...\n")
@@ -254,13 +255,13 @@ func RunReconcileApply(opt *ReconcileApplyOptions) error {
 			SkipSuffixes: splitList(opt.SkipSuffixes),
 			SkipNames:    splitList(opt.SkipNames),
 		},
-		RemovalMode:      mode,
-		QuarantineRoot:   opt.QuarantineRoot,
-		ConfirmRemoval:   opt.ConfirmRemoval,
+		RemovalMode:        mode,
+		QuarantineRoot:     opt.QuarantineRoot,
+		ConfirmRemoval:     opt.ConfirmRemoval,
 		AcknowledgeRecycle: opt.AcknowledgeRecycle,
-		MaxRemovePercent: opt.MaxRemovePercent,
-		MaxRemoveBytes:   opt.MaxRemoveBytes,
-		AcknowledgeBlast: opt.AcknowledgeBlast,
+		MaxRemovePercent:   opt.MaxRemovePercent,
+		MaxRemoveBytes:     opt.MaxRemoveBytes,
+		AcknowledgeBlast:   opt.AcknowledgeBlast,
 	})
 	if err != nil {
 		return err

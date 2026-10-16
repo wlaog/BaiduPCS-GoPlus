@@ -1,18 +1,13 @@
 package reconcile
 
 import (
-	"crypto/md5"
-	"encoding/hex"
 	"fmt"
-	"io"
 	"os"
 	"path"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
-
-	"github.com/qjfoidnh/BaiduPCS-Go/baidupcs"
 )
 
 // LocalEntry is one file or directory under the local root, reduced to what the
@@ -30,7 +25,8 @@ type LocalEntry struct {
 	// IsDir reports whether this is a directory.
 	IsDir bool
 	// Mtime is the modification time in Unix seconds.
-	Mtime int64
+	Mtime     int64
+	MtimeNano int64
 	// Sparse reports an entry that exists in the cloud but cannot be
 	// represented faithfully on Windows (illegal name, over-long path, ...).
 	// These are never removed and never uploaded.
@@ -39,6 +35,7 @@ type LocalEntry struct {
 
 // LocalScanOptions tunes the local walk.
 type LocalScanOptions struct {
+	Progress ProgressFunc
 	// SkipNames are file/directory names skipped anywhere in the tree.
 	SkipNames []string
 	// SkipSuffixes are filename suffixes skipped anywhere in the tree.
@@ -106,9 +103,11 @@ type LocalScanResult struct {
 // CloudContentHash is the content hash the reconciler computes for comparison.
 type CloudContentHash struct {
 	// MD5 is the full-file MD5 as a lowercase hex string.
-	MD5 string
-	// SliceMD5 is the MD5 of the first 256KB, which is what the cloud API
-	// exposes as the first block_list entry.
+	MD5        string
+	MtimeNano  int64
+	ChunkSize  int64
+	BlocksList []string
+	// SliceMD5 is the leading-256KiB checksum required by rapid upload.
 	SliceMD5 string
 	// Size is the file size used for the hash.
 	Size int64
@@ -117,53 +116,9 @@ type CloudContentHash struct {
 }
 
 // LocalContentHash computes the full MD5 and the leading-256KB MD5 of a local
-// file. The second value is what can be compared against the cloud API's
-// block_list[0] without downloading anything.
+// file, along with protocol block hashes for a possible subsequent upload.
 func LocalContentHash(localPath string) (CloudContentHash, error) {
-	var out CloudContentHash
-	f, err := os.Open(localPath)
-	if err != nil {
-		return out, err
-	}
-	defer f.Close()
-
-	info, err := f.Stat()
-	if err != nil {
-		return out, err
-	}
-	out.Size = info.Size()
-	out.Mtime = info.ModTime().Unix()
-
-	full := md5.New()
-	slice := md5.New()
-
-	const sliceSize = int64(baidupcs.SliceMD5Size)
-	buf := make([]byte, 1<<20)
-	var read int64
-	for {
-		n, rErr := f.Read(buf)
-		if n > 0 {
-			full.Write(buf[:n])
-			if read < sliceSize {
-				remain := sliceSize - read
-				if int64(n) <= remain {
-					slice.Write(buf[:n])
-				} else {
-					slice.Write(buf[:remain])
-				}
-				read += int64(n)
-			}
-		}
-		if rErr == io.EOF {
-			break
-		}
-		if rErr != nil {
-			return out, rErr
-		}
-	}
-	out.MD5 = hex.EncodeToString(full.Sum(nil))
-	out.SliceMD5 = hex.EncodeToString(slice.Sum(nil))
-	return out, nil
+	return hashFile(localPath, nil)
 }
 
 // ScanLocal walks the local root and builds a normalised entry map.
@@ -217,6 +172,7 @@ func ScanLocal(root string, opt LocalScanOptions) (*LocalScanResult, error) {
 		cur := queue[0]
 		queue = queue[1:]
 
+		opt.Progress.emit(Progress{Phase: "local", Current: cur.rel, Files: res.Stats.FileCount, Dirs: res.Stats.DirCount, Bytes: res.Stats.TotalBytes})
 		dirEntries, readErr := os.ReadDir(cur.abs)
 		if readErr != nil {
 			// An unreadable local directory is fatal: treating it as empty
@@ -226,6 +182,9 @@ func ScanLocal(root string, opt LocalScanOptions) (*LocalScanResult, error) {
 		sort.Slice(dirEntries, func(i, j int) bool { return dirEntries[i].Name() < dirEntries[j].Name() })
 
 		for _, de := range dirEntries {
+			if (res.Stats.FileCount+res.Stats.DirCount)%128 == 0 {
+				opt.Progress.emit(Progress{Phase: "local", Current: cur.rel, Files: res.Stats.FileCount, Dirs: res.Stats.DirCount, Bytes: res.Stats.TotalBytes})
+			}
 			if len(res.Entries) >= opt.MaxEntries {
 				res.Stats.Truncated = true
 				res.Warnings = append(res.Warnings,
@@ -244,17 +203,15 @@ func ScanLocal(root string, opt LocalScanOptions) (*LocalScanResult, error) {
 				continue
 			}
 			sparse := localNameUnsafe(name)
-			if sparse == "" {
-				if len(childAbs) > 250 {
-					sparse = "本地绝对路径过长, 云端可能无法表示"
-				}
-			}
+			// Local byte length says nothing about the cloud path's validity:
+			// Chinese UTF-8 paths routinely exceed 250 bytes while remaining
+			// short Windows paths. Let filesystem calls report actual access
+			// errors; cloud paths are built independently from relative paths.
 
 			// Lstat: do not follow links while deciding the type.
 			li, lErr := os.Lstat(childAbs)
 			if lErr != nil {
-				res.Warnings = append(res.Warnings, fmt.Sprintf("跳过无法读取状态的条目 %s: %v", rel, lErr))
-				continue
+				return nil, fmt.Errorf("本地条目无法读取状态，扫描不完整: %s: %w", rel, lErr)
 			}
 			isLink := li.Mode()&os.ModeSymlink != 0
 			if isLink {
@@ -264,7 +221,7 @@ func ScanLocal(root string, opt LocalScanOptions) (*LocalScanResult, error) {
 			if li.IsDir() || (isLink && opt.FollowLinks && isDirFollowing(childAbs)) {
 				res.Entries[rel] = LocalEntry{
 					RelPath: rel, AbsPath: childAbs, Name: name,
-					IsDir: true, Mtime: li.ModTime().Unix(), Sparse: sparse,
+					IsDir: true, Mtime: li.ModTime().Unix(), MtimeNano: li.ModTime().UnixNano(), Sparse: sparse,
 				}
 				res.Order = append(res.Order, rel)
 				res.Stats.DirCount++
@@ -296,7 +253,7 @@ func ScanLocal(root string, opt LocalScanOptions) (*LocalScanResult, error) {
 
 			res.Entries[rel] = LocalEntry{
 				RelPath: rel, AbsPath: childAbs, Name: name,
-				Size: li.Size(), Mtime: li.ModTime().Unix(), Sparse: sparse,
+				Size: li.Size(), Mtime: li.ModTime().Unix(), MtimeNano: li.ModTime().UnixNano(), Sparse: sparse,
 			}
 			res.Order = append(res.Order, rel)
 			res.Stats.FileCount++
@@ -395,8 +352,8 @@ func IsEditing(e LocalEntry, now time.Time, window time.Duration) bool {
 }
 
 // CheckLocalUnchanged re-checks that a local file still has the size and mtime
-// observed during the scan. It is the guard against uploading a half-written
-// file: if the file changed between planning and uploading, we refuse.
+// observed during the scan. If the file changed after planning, its cloud
+// versions must be preserved until a new preview confirms the content.
 func CheckLocalUnchanged(e LocalEntry) error {
 	info, err := os.Stat(e.AbsPath)
 	if err != nil {
@@ -409,7 +366,7 @@ func CheckLocalUnchanged(e LocalEntry) error {
 		return fmt.Errorf("本地文件在计划生成后大小已改变 (%d -> %d), 可能正在写入: %s",
 			e.Size, info.Size(), e.RelPath)
 	}
-	if info.ModTime().Unix() != e.Mtime {
+	if info.ModTime().Unix() != e.Mtime || (e.MtimeNano != 0 && info.ModTime().UnixNano() != e.MtimeNano) {
 		return fmt.Errorf("本地文件在计划生成后修改时间已改变, 可能正在编辑: %s", e.RelPath)
 	}
 	return nil

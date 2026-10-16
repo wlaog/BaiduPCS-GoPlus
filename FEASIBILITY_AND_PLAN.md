@@ -1,5 +1,9 @@
 # 阶段一交付：可行性分析与实现计划
 
+> 当前需求已收敛为删除与重命名（v0.4.0-dev），上传和新建目录由官方备份负责；本文件仅为早期历史。当前实现见 [README](README.md) 和 [实现与验证](docs/PERFORMANCE_AND_PROGRESS.md)。
+
+
+
 > 历史阶段记录：本文件描述阶段一当时的调查与待验证事项，不代表当前发版状态。当前功能和用法见 [README](README.md)。许可证以仓库 [LICENSE](LICENSE) 为准（Apache-2.0）。
 
 > 对应 `README_BaiduPCS_Backup_Reconcile.md` 第 3 节（Go/No-Go）与第 9 节（交付物 1）。

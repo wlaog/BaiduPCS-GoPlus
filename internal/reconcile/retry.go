@@ -30,14 +30,15 @@ type RetryPolicy struct {
 	Spacing time.Duration
 }
 
-// DefaultRetryPolicy is tuned for Baidu's observed behaviour: roughly one
-// request per second, with up to five tries backing off to a couple of seconds.
+// DefaultRetryPolicy bounds metadata request starts to five per second per
+// adapter, with up to five attempts. This is a conservative starting point,
+// not a claim about the provider's undocumented account-specific quota.
 func DefaultRetryPolicy() RetryPolicy {
 	return RetryPolicy{
 		MaxAttempts: 5,
 		BaseDelay:   700 * time.Millisecond,
 		MaxDelay:    8 * time.Second,
-		Spacing:     900 * time.Millisecond,
+		Spacing:     200 * time.Millisecond,
 	}
 }
 
@@ -66,11 +67,19 @@ var retryableRemoteCodes = map[int]bool{
 	-3:    true, // 不存在
 	31045: true, // user not exists / 登录过期
 	31064: true, // 未登录
+	31171: true, // another async job is running
 }
 
 // isRetryable reports whether another attempt could plausibly succeed.
 func isRetryable(err error) bool {
 	if err == nil {
+		return false
+	}
+	if IsNotFound(err) || IsAuthExpired(err) {
+		return false
+	}
+	var stale *changedState
+	if errors.As(err, &stale) || errors.Is(err, ErrUsage) {
 		return false
 	}
 	var re *RemoteError

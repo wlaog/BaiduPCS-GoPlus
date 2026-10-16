@@ -1,6 +1,6 @@
 param(
   [ValidatePattern('^v\d+\.\d+\.\d+(-[a-zA-Z0-9.-]+)?$')]
-  [string]$Version = 'v0.2.0'
+  [string]$Version = 'v0.4.1'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -13,7 +13,7 @@ New-Item -ItemType Directory -Force -Path $stage, $outputDir | Out-Null
 # existing binary, config, cookie files, reports, caches, or browser profile.
 & (Join-Path $PSScriptRoot 'build.ps1') -SkipDeps -Test -Version $Version -OutName "release-$Version.exe"
 Copy-Item -LiteralPath (Join-Path $repoRoot ".tools/release-$Version.exe") -Destination (Join-Path $stage 'BaiduPCS-GoPlus.exe')
-foreach ($name in @('README.md', 'LICENSE', 'NOTICE', 'start-gui.cmd')) {
+foreach ($name in @('README.md', 'RELEASE_NOTES.md', 'LICENSE', 'NOTICE', 'start-gui.cmd')) {
   Copy-Item -LiteralPath (Join-Path $repoRoot $name) -Destination $stage
 }
 # Keep the Unicode filename without requiring a particular shell code page.
@@ -23,6 +23,7 @@ if (@($psLauncher).Count -ne 1) { throw 'Expected one root PowerShell GUI launch
 Copy-Item -LiteralPath $psLauncher.FullName -Destination $stage
 New-Item -ItemType Directory -Path (Join-Path $stage 'docs') | Out-Null
 Copy-Item -LiteralPath (Join-Path $repoRoot 'docs/README_UPSTREAM.md') -Destination (Join-Path $stage 'docs')
+Copy-Item -LiteralPath (Join-Path $repoRoot 'docs/PERFORMANCE_AND_PROGRESS.md') -Destination (Join-Path $stage 'docs')
 
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $zipPath = Join-Path $outputDir "BaiduPCS-GoPlus-$Version-windows-amd64.zip"

@@ -2,8 +2,13 @@ package reconcile
 
 import (
 	"fmt"
+	"os"
+	"path"
+	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -11,6 +16,8 @@ import (
 type ActionKind string
 
 const (
+	ActionRename  ActionKind = "RENAME"
+	ActionPending ActionKind = "WAIT"
 	// ActionUpload means the path exists locally but not on the cloud.
 	ActionUpload ActionKind = "UPLOAD"
 	// ActionReplace means the path exists on both sides but the cloud copy is
@@ -34,12 +41,11 @@ type ComparisonRule string
 
 const (
 	// RuleHashMatch: a trustworthy server hash equals the locally computed hash.
-	RuleHashMatch ComparisonRule = "哈希一致(服务端单分片, 可信)"
+	RuleHashMatch ComparisonRule = "完整内容哈希一致"
 	// RuleHashMismatch: a trustworthy server hash differs.
-	RuleHashMismatch ComparisonRule = "哈希不一致(服务端单分片, 可信)"
-	// RuleHashUnavailable: the server hash is multi-block or absent, so it
-	// cannot confirm equality.
-	RuleHashUnavailable ComparisonRule = "服务端哈希不可信(多分片/缺失)"
+	RuleHashMismatch ComparisonRule = "完整内容哈希不同"
+	// RuleHashUnavailable: no usable content hash was reported.
+	RuleHashUnavailable ComparisonRule = "服务端内容哈希缺失或不可用"
 	// RuleSizeDiffers: sizes differ, which alone proves the content differs.
 	RuleSizeDiffers ComparisonRule = "大小不同"
 	// RuleSizeOnlyEqual: sizes match but no dependable hash was available.
@@ -50,24 +56,35 @@ const (
 
 // PlannedAction is one decided operation. Nothing in this file executes it.
 type PlannedAction struct {
-	Kind ActionKind
+	SourcePath string
+	// Requires is a canonical local version that must be present before an
+	// older duplicate can be removed.
+	Requires string
+	Kind     ActionKind
 	// RelPath is the "/"-separated path relative to both roots ("" for the root
 	// itself).
 	RelPath string
 	// RemotePath is the absolute cloud path this action concerns.
 	RemotePath string
-	// LocalPath is the absolute local path (empty for REMOVE).
+	// LocalPath is the corresponding local version, also used by history cleanup.
 	LocalPath string
 	// LocalSize and LocalMtime are the local file's size and mtime as observed
-	// during the scan. They are the snapshot the executor re-checks before
-	// uploading: comparing against a freshly stat'ed value would make the check
-	// vacuous, because the file would always match itself.
-	LocalSize  int64
-	LocalMtime int64
+	// during the scan. The executor re-checks them before renaming or
+	// removing history; comparing against a fresh snapshot would be vacuous.
+	LocalSize      int64
+	LocalMtime     int64
+	LocalMtimeNano int64
+	// Hash is retained in memory for this plan, never written into reports.
+	Hash         *CloudContentHash `json:"-"`
+	ReuseFrom    string
+	RemovedFiles int
 	// Size is the byte count of the content involved.
 	Size int64
 	// IsDir reports that the path is a directory.
 	IsDir bool
+	// WholeDir means descendants were deliberately not enumerated. The folder
+	// and everything beneath it are removed as one explicitly previewed unit.
+	WholeDir bool
 	// Rule records the comparison outcome for file pairs.
 	Rule ComparisonRule
 	// Reason is the human-readable explanation shown in the preview.
@@ -77,27 +94,24 @@ type PlannedAction struct {
 	Blocked bool
 	// Stable records whether the local file was quiet long enough to be
 	// considered settled. An unstable action is still planned, but the executor
-	// MUST re-verify the local snapshot before uploading it.
+	// MUST re-verify the local snapshot before changing its cloud versions.
 	Stable bool
 }
 
 // PlanOptions configures plan generation.
 type PlanOptions struct {
+	Progress     ProgressFunc
+	HashCache    *HashCache
+	UseHashCache bool
+	HashWorkers  int
 	// LocalRoot is the authoritative local directory.
 	LocalRoot string
 	// RemoteRoot is the cloud directory to make match LocalRoot.
 	RemoteRoot string
-	// HashFiles computes content hashes for candidate files. It costs local
-	// reads and, for large files, cannot make the server side trustworthy, but
-	// it upgrades small-file comparisons from "size only" to a proof.
+	// HashFiles retains the legacy front-end preference. Content comparisons
+	// always require hashes; callers opt into cache reuse with UseHashCache.
 	HashFiles bool
-	// Conservative decides what "same size, no trustworthy hash" means.
-	// false (the default) re-uploads, which is idempotent and repairs silent
-	// divergence. true reports CONFLICT instead, which uploads nothing but
-	// leaves potential divergence in place.
-	//
-	// The polarity is deliberate: this is a plain bool, so the zero value has to
-	// be the behaviour a caller who did not think about it should get.
+	// Conservative is a legacy input; cleanup always requires content evidence.
 	Conservative bool
 	// SkipSuffixes overrides the transient-file exclusions.
 	SkipSuffixes []string
@@ -114,21 +128,22 @@ type PlanOptions struct {
 }
 
 func (o PlanOptions) withDefaults() PlanOptions {
-	// SizeOnlyEqualReplace defaults via an explicit setter so that a zero-value
-	// PlanOptions from a test still behaves like the CLI default.
 	return o
 }
 
 // Plan is the complete, reviewable difference between the two trees.
 type Plan struct {
-	GeneratedAt string
-	LocalRoot   string
-	RemoteRoot  string
+	Performance   PlanPerformance
+	cloudSnapshot map[string]RemoteEntry
+	GeneratedAt   string
+	LocalRoot     string
+	RemoteRoot    string
 	// StructuralDigest identifies the exact cloud snapshot this plan was built
 	// from. Re-running a plan and getting the same digest means the cloud state
 	// did not move.
 	StructuralDigest string
-	// UploadDirCount is how many cloud directories must be created first.
+	// UploadDirCount and the legacy write-action slices are retained only
+	// to reject incompatible full-mirror plans. New plans leave them empty.
 	UploadDirCount int
 
 	Uploads   []PlannedAction
@@ -137,6 +152,8 @@ type Plan struct {
 	Removes   []PlannedAction
 	Keeps     []PlannedAction
 	Conflicts []PlannedAction
+	Renames   []PlannedAction
+	Pending   []PlannedAction
 
 	// LocalFiles, LocalDirs, CloudFiles, CloudDirs describe the inputs.
 	LocalFiles int
@@ -160,14 +177,23 @@ type Plan struct {
 	SkipNotices []string
 }
 
+type PlanPerformance struct {
+	HashBytes     int64 `json:"hashBytes"`
+	CacheHits     int   `json:"cacheHits"`
+	CloudListings int   `json:"cloudListings"`
+	ReuseFiles    int   `json:"reuseFiles"`
+	ReuseBytes    int64 `json:"reuseBytes"`
+	PrunedDirs    int   `json:"prunedDirs"`
+}
+
 // Changes reports how many actions would modify the cloud.
 func (p *Plan) Changes() int {
-	return len(p.Uploads) + len(p.Replaces) + len(p.Removes) + len(p.Mkdirs)
+	return len(p.Renames) + len(p.Removes)
 }
 
 // ZeroDifference reports whether the cloud already matches the local tree.
 func (p *Plan) ZeroDifference() bool {
-	return p.Changes() == 0
+	return p.Changes() == 0 && len(p.Pending) == 0 && len(p.Conflicts) == 0
 }
 
 // HasConflicts reports whether any path needs human judgement.
@@ -191,8 +217,11 @@ func (p *Plan) UploadBytes() int64 {
 func (p *Plan) RemoveBytes() int64 {
 	var n int64
 	for _, a := range p.Removes {
-		if !a.IsDir {
-			n += a.Size
+		n += a.Size
+	}
+	for _, a := range p.Renames {
+		if old, ok := p.cloudSnapshot[a.RemotePath]; ok {
+			n += old.Size
 		}
 	}
 	return n
@@ -205,522 +234,439 @@ func (p *Plan) RemoveFiles() int {
 	for _, a := range p.Removes {
 		if !a.IsDir {
 			n++
+		} else {
+			n += a.RemovedFiles
+		}
+	}
+	for _, a := range p.Renames {
+		if _, ok := p.cloudSnapshot[a.RemotePath]; ok {
+			n++
 		}
 	}
 	return n
 }
 
-// BuildPlan reads both sides and produces a difference plan. It performs no
-// mutation: the cloud side is reached only through Reader, and the local side
-// only through read-only filesystem calls.
+func (p *Plan) UnscannedRemoveDirs() int {
+	n := 0
+	for _, a := range p.Removes {
+		if a.WholeDir {
+			n++
+		}
+	}
+	return n
+}
+
+// BuildPlan only plans recycle-bin removals and renames of confirmed versions.
+// Missing local versions are left to the official backup client.
 func BuildPlan(r Reader, opt PlanOptions) (*Plan, error) {
 	if r == nil {
 		return nil, ErrNoClient
 	}
-	if strings.TrimSpace(opt.LocalRoot) == "" {
-		return nil, fmt.Errorf("%w: 必须指定本地目录", ErrUsage)
+	if strings.TrimSpace(opt.LocalRoot) == "" || strings.TrimSpace(opt.RemoteRoot) == "" {
+		return nil, fmt.Errorf("%w: 必须指定本地和云端目录", ErrUsage)
 	}
-	remoteRoot := NormalizeRemoteRoot(opt.RemoteRoot)
-	if remoteRoot == "/" {
-		return nil, fmt.Errorf("%w: 云端目录不能是根目录 /, 请指定具体的备份子目录", ErrUsage)
+	root := NormalizeRemoteRoot(opt.RemoteRoot)
+	if root == "/" {
+		return nil, fmt.Errorf("%w: 云端目录不能为根目录", ErrUsage)
 	}
 	if opt.Now.IsZero() {
 		opt.Now = time.Now()
 	}
-	// A negative window disables the mid-write check, which tests need in order
-	// to exercise comparison rules on files just written to a temp dir.
-	if opt.EditingWindow == 0 {
-		opt.EditingWindow = 2 * time.Minute
-	}
-
-	plan := &Plan{
-		GeneratedAt: opt.Now.Format(time.RFC3339),
-		LocalRoot:   opt.LocalRoot,
-		RemoteRoot:  remoteRoot,
-	}
-
-	// Local side first: if the local tree cannot be read, there is nothing to
-	// mirror and no reason to touch the cloud.
-	local, err := ScanLocal(opt.LocalRoot, LocalScanOptions{
-		SkipSuffixes: opt.SkipSuffixes,
-		SkipNames:    opt.SkipNames,
-		SkipPrefixes: opt.SkipPrefixes,
-	})
+	local, err := ScanLocal(opt.LocalRoot, LocalScanOptions{Progress: opt.Progress, SkipSuffixes: opt.SkipSuffixes, SkipPrefixes: opt.SkipPrefixes, SkipNames: opt.SkipNames})
 	if err != nil {
 		return nil, err
 	}
-	plan.LocalRoot = local.Root
-	plan.LocalFiles = local.Stats.FileCount
-	plan.LocalDirs = local.Stats.DirCount
-	plan.LocalBytes = local.Stats.TotalBytes
-	plan.LocalScanComplete = !local.Stats.Truncated
-	plan.Warnings = append(plan.Warnings, local.Warnings...)
-	if local.Stats.Skipped > 0 {
-		plan.SkipNotices = append(plan.SkipNotices, fmt.Sprintf(
-			"本地有 %d 个条目被排除规则跳过 (临时文件/符号链接等); 它们在云端的同路径项不会被删除, 需要你单独处理",
-			local.Stats.Skipped))
+	opt.Limits.Progress = opt.Progress
+	opt.Limits.PruneDir = func(ce RemoteEntry) bool {
+		rel := RelPath(root, ce.Path)
+		// Excluded paths and ambiguous local ancestors stay protected. For a
+		// genuinely absent folder, child-level exclusions do not retain shells.
+		for ancestor := rel; ancestor != ""; ancestor = ParentRel(ancestor) {
+			if UnsafeNameReason(path.Base(ancestor)) != "" || shouldSkipLocal(path.Base(ancestor), LocalScanOptions{SkipSuffixes: opt.SkipSuffixes, SkipNames: opt.SkipNames, SkipPrefixes: opt.SkipPrefixes}) {
+				return false
+			}
+			if le, ok := local.Entries[ancestor]; ok && (ancestor == rel || le.Sparse != "" || !le.IsDir) {
+				return false
+			}
+		}
+		_, err := os.Lstat(filepath.Join(local.Root, filepath.FromSlash(rel)))
+		return os.IsNotExist(err)
 	}
-
-	// Cloud side.
-	scan, err := ScanCloud(r, remoteRoot, opt.Limits)
+	scan, err := ScanCloud(r, root, opt.Limits)
 	if err != nil {
 		return nil, err
 	}
-	plan.CloudFiles = scan.Stats.FileCount
-	plan.CloudDirs = scan.Stats.DirCount
-	plan.CloudBytes = scan.Stats.TotalBytes
-	plan.StructuralDigest = scan.StructuralDigest()
-	plan.ScanComplete = scan.ScanComplete() && !scan.ShortOfRequestedDepth()
+	plan := &Plan{GeneratedAt: opt.Now.Format(time.RFC3339), LocalRoot: local.Root, RemoteRoot: root,
+		LocalFiles: local.Stats.FileCount, LocalDirs: local.Stats.DirCount, LocalBytes: local.Stats.TotalBytes,
+		CloudFiles: scan.Stats.FileCount, CloudDirs: scan.Stats.DirCount, CloudBytes: scan.Stats.TotalBytes,
+		cloudSnapshot: scan.Entries, StructuralDigest: scan.StructuralDigest(),
+		ScanComplete: scan.ScanComplete() && !scan.ShortOfRequestedDepth(), LocalScanComplete: !local.Stats.Truncated,
+		Warnings: append([]string(nil), local.Warnings...)}
+	plan.Performance.CloudListings = scan.Stats.ListingRequests
+	plan.Performance.PrunedDirs = len(scan.PrunedDirs)
+	if len(scan.PrunedDirs) > 0 {
+		plan.SkipNotices = append(plan.SkipNotices, fmt.Sprintf("%d 个本地不存在的云端目录按整目录回收，不扫描内部文件；其全部内容（含临时文件）一并回收，内部数量与容量未统计", len(scan.PrunedDirs)))
+	}
+	seen := make(map[string]bool)
+	for _, abs := range scan.Order {
+		if seen[abs] || !IsSubPath(root, abs) {
+			plan.ScanComplete = false
+			plan.ScanErrors = append(plan.ScanErrors, "云端路径重复或越界，扫描不可用于执行")
+		}
+		seen[abs] = true
+	}
 	for _, e := range scan.Stats.Errors {
 		plan.ScanErrors = append(plan.ScanErrors, fmt.Sprintf("%s: %s", e.Path, e.Err))
 	}
-	if len(scan.Stats.LargeDirs) > 0 {
-		for dir, n := range scan.Stats.LargeDirs {
-			plan.Warnings = append(plan.Warnings, fmt.Sprintf(
-				"目录 %s 的子项数达到分页上限(%d), 上游分页异常时会静默返回部分数据, 建议人工复核", dir, n))
+	p := &cleanupPlanner{plan: plan, local: local, scan: scan, opt: opt, versions: make(map[string][]RemoteEntry), owners: make(map[string]string), protected: make(map[string]bool), sources: make(map[string]bool), hashes: make(map[string]hashResult), dependencies: make(map[string]PlannedAction)}
+	// Assign each suffix file to its nearest real local name. A real a(1).txt
+	// takes precedence over a.txt and is never treated as its disposable copy.
+	for _, abs := range scan.Order {
+		ce := scan.Entries[abs]
+		if ce.IsDir || p.excluded(ce) || scan.UnsafeNames[abs] != "" {
+			continue
+		}
+		rel := RelPath(root, abs)
+		if _, exists := local.Entries[rel]; exists {
+			continue
+		}
+		name := ce.Name
+		for {
+			base, ok := stripVersionSuffix(name)
+			if !ok {
+				break
+			}
+			name = base
+			candidate := JoinRemote(ParentRel(rel), name)
+			candidate = strings.TrimPrefix(candidate, "/")
+			if le, exists := local.Entries[candidate]; exists && !le.IsDir {
+				p.versions[candidate] = append(p.versions[candidate], ce)
+				p.owners[abs] = candidate
+				break
+			}
 		}
 	}
-
-	planner := &planner{
-		plan:    plan,
-		opt:     opt,
-		local:   local,
-		scan:    scan,
-		now:     opt.Now,
-		dirsSet: make(map[string]bool),
+	p.prepareHashes()
+	for _, rel := range local.Order {
+		p.classifyLocal(rel, local.Entries[rel])
 	}
-	planner.build()
+	p.classifyExtras()
+	sortActions(plan.Renames)
+	sortActions(plan.Removes)
+	sortActions(plan.Pending)
+	sortActions(plan.Keeps)
+	sortActions(plan.Conflicts)
+	opt.Progress.emit(Progress{Phase: "planned", Done: int64(local.Stats.FileCount), Total: int64(local.Stats.FileCount), Files: local.Stats.FileCount, Dirs: local.Stats.DirCount})
 	return plan, nil
 }
 
-type planner struct {
-	plan  *Plan
-	opt   PlanOptions
-	local *LocalScanResult
-	scan  *CloudScan
-	now   time.Time
-	// dirsSet tracks cloud directories already planned for creation so Mkdir
-	// actions are not duplicated.
-	dirsSet map[string]bool
+type hashResult struct {
+	hash   CloudContentHash
+	err    error
+	cached bool
+}
+type cleanupPlanner struct {
+	plan               *Plan
+	local              *LocalScanResult
+	scan               *CloudScan
+	opt                PlanOptions
+	versions           map[string][]RemoteEntry
+	owners             map[string]string
+	protected, sources map[string]bool
+	hashes             map[string]hashResult
+	dependencies       map[string]PlannedAction
 }
 
-func (p *planner) build() {
-	p.classifyLocal()
-	p.classifyCloudOnly()
-	p.detectCloudAliases()
-	p.finalize()
-}
-
-// classifyLocal walks the local tree and decides UPLOAD/REPLACE/KEEP/CONFLICT
-// for each entry.
-func (p *planner) classifyLocal() {
-	rels := make([]string, 0, len(p.local.Entries))
-	for rel := range p.local.Entries {
-		rels = append(rels, rel)
+func stripVersionSuffix(name string) (string, bool) {
+	ext := path.Ext(name)
+	stem := strings.TrimSuffix(name, ext)
+	for _, pair := range [][2]string{{"(", ")"}, {"（", "）"}} {
+		if !strings.HasSuffix(stem, pair[1]) {
+			continue
+		}
+		i := strings.LastIndex(stem, pair[0])
+		if i <= 0 {
+			continue
+		}
+		digits := strings.TrimSuffix(stem[i+len(pair[0]):], pair[1])
+		if digits == "" {
+			continue
+		}
+		valid := false
+		for _, c := range digits {
+			if c < '0' || c > '9' {
+				valid = false
+				break
+			}
+			if c != '0' {
+				valid = true
+			}
+		}
+		if valid {
+			base := strings.TrimRight(stem[:i], " ")
+			if base != "" {
+				return base + ext, true
+			}
+		}
 	}
-	sort.Strings(rels)
+	return "", false
+}
 
-	for _, rel := range rels {
+func (p *cleanupPlanner) prepareHashes() {
+	var candidates []LocalEntry
+	for _, rel := range p.local.Order {
 		le := p.local.Entries[rel]
-		remotePath := JoinRemote(p.scan.Root, rel)
-		ce, onCloud := p.scan.Entries[remotePath]
+		if le.IsDir || le.Sparse != "" {
+			continue
+		}
+		entries := append([]RemoteEntry(nil), p.versions[rel]...)
+		if ce, ok := p.scan.Entries[JoinRemote(p.scan.Root, rel)]; ok {
+			entries = append(entries, ce)
+		}
+		for _, ce := range entries {
+			if !ce.IsDir && ce.Size == le.Size && ce.ContentMD5Trusted && looksLikeMD5(ce.ContentMD5) {
+				candidates = append(candidates, le)
+				break
+			}
+		}
+	}
+	workers := p.opt.HashWorkers
+	if workers <= 0 {
+		workers = 2
+	}
+	if workers > 4 {
+		workers = 4
+	}
+	jobs := make(chan LocalEntry)
+	type result struct {
+		rel string
+		v   hashResult
+	}
+	results := make(chan result)
+	var wg sync.WaitGroup
+	var read, done atomic.Int64
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for le := range jobs {
+				var v hashResult
+				info, err := os.Stat(le.AbsPath)
+				if err == nil && p.opt.UseHashCache {
+					v.hash, v.cached = p.opt.HashCache.get(le.AbsPath, info)
+				}
+				if err != nil {
+					v.err = err
+				} else if !v.cached {
+					var previous int64
+					v.hash, v.err = hashFile(le.AbsPath, func(n int64) {
+						total := read.Add(n - previous)
+						previous = n
+						p.opt.Progress.emit(Progress{Phase: "hash", Current: le.RelPath, Done: done.Load(), Total: int64(len(candidates)), Bytes: total})
+					})
+				}
+				if v.err == nil && (v.hash.Size != le.Size || v.hash.MtimeNano != le.MtimeNano) {
+					v.err = fmt.Errorf("文件在扫描后发生变化")
+				}
+				if v.err == nil {
+					p.opt.HashCache.put(le.AbsPath, v.hash)
+				}
+				results <- result{le.RelPath, v}
+			}
+		}()
+	}
+	go func() {
+		for _, le := range candidates {
+			jobs <- le
+		}
+		close(jobs)
+		wg.Wait()
+		close(results)
+	}()
+	for res := range results {
+		p.hashes[res.rel] = res.v
+		if res.v.cached {
+			p.plan.Performance.CacheHits++
+		}
+		n := done.Add(1)
+		p.opt.Progress.emit(Progress{Phase: "hash", Current: res.rel, Done: n, Total: int64(len(candidates)), Bytes: read.Load()})
+	}
+	p.plan.Performance.HashBytes = read.Load()
+	if p.opt.UseHashCache {
+		p.plan.Warnings = append(p.plan.Warnings, "快速校验复用大小及修改时间未变的哈希；需要完整内容核对时请开启重新核对选项")
+	}
+}
 
-		if le.IsDir {
-			if onCloud && !ce.IsDir {
-				p.conflict(rel, remotePath, le.AbsPath,
-					"本地是目录, 云端同路径是文件: 需要先移走云端文件才能建目录, 请人工确认")
+func (p *cleanupPlanner) classifyLocal(rel string, le LocalEntry) {
+	target := JoinRemote(p.scan.Root, rel)
+	ce, exists := p.scan.Entries[target]
+	a := PlannedAction{RelPath: rel, RemotePath: target, LocalPath: le.AbsPath, LocalSize: le.Size, LocalMtime: le.Mtime, LocalMtimeNano: le.MtimeNano, Size: le.Size, IsDir: le.IsDir, Stable: true}
+	protect := func() {
+		p.protected[target] = true
+		for _, v := range p.versions[rel] {
+			p.protected[v.Path] = true
+		}
+	}
+	if le.Sparse != "" || exists && le.IsDir != ce.IsDir {
+		a.Kind = ActionConflict
+		a.Reason = "名称或文件/目录类型不匹配，跳过此项"
+		p.plan.Conflicts = append(p.plan.Conflicts, a)
+		protect()
+		return
+	}
+	if le.IsDir {
+		if !exists {
+			a.Kind = ActionPending
+			a.Reason = "等待官方备份创建目录"
+			p.plan.Pending = append(p.plan.Pending, a)
+		}
+		return
+	}
+	v, hashed := p.hashes[rel]
+	if hashed && v.err != nil {
+		a.Kind = ActionConflict
+		a.Reason = "无法稳定读取本地文件: " + v.err.Error()
+		p.plan.Conflicts = append(p.plan.Conflicts, a)
+		protect()
+		return
+	}
+	if hashed {
+		h := v.hash
+		a.Hash = &h
+		if exists && matchesHash(ce, &h, le.Size) {
+			a.Kind = ActionKeep
+			a.Reason = "内容一致"
+			p.plan.Keeps = append(p.plan.Keeps, a)
+			p.dependencies[rel] = a
+			return
+		}
+		for _, version := range p.versions[rel] {
+			if p.scan.UnsafeNames[version.Path] != "" || !matchesHash(version, &h, le.Size) {
 				continue
 			}
-			if !onCloud {
-				p.planMkdir(rel, remotePath)
+			a.Kind = ActionRename
+			a.SourcePath = version.Path
+			a.Reason = "已按完整内容哈希匹配本地版本，重命名为本地名称"
+			if exists {
+				a.Reason += "；先将同名旧版移入回收站"
 			}
-			// An existing cloud directory needs no action of its own; its
-			// children are handled individually.
-			continue
+			p.plan.Renames = append(p.plan.Renames, a)
+			p.sources[version.Path] = true
+			p.dependencies[rel] = a
+			return
 		}
-
-		// Local is a regular file.
-		if le.Sparse != "" {
-			p.conflict(rel, remotePath, le.AbsPath, "本地文件名无法忠实映射到云端: "+le.Sparse)
-			continue
-		}
-		if !onCloud {
-			p.upload(rel, remotePath, le)
-			continue
-		}
-		if ce.IsDir {
-			p.conflict(rel, remotePath, le.AbsPath,
-				"本地是文件, 云端同路径是目录: 不会自动删除云端目录, 请人工确认")
-			continue
-		}
-
-		// Same path, both regular files: compare.
-		action, keep := p.compare(rel, remotePath, le, ce)
-		if keep {
-			p.plan.Keeps = append(p.plan.Keeps, action)
-			continue
-		}
-		if action.Kind == ActionConflict {
-			p.plan.Conflicts = append(p.plan.Conflicts, action)
-			continue
-		}
-		// A replace needs its parent directory present, which it already is.
-		p.plan.Replaces = append(p.plan.Replaces, action)
 	}
+	a.Kind = ActionPending
+	a.Reason = "未找到可确认与本地一致的云端版本，等待官方备份；保留此文件的历史版本"
+	p.plan.Pending = append(p.plan.Pending, a)
+	protect()
 }
 
-// compare decides whether a local/cloud file pair is identical.
-//
-// The asymmetry is deliberate: a matching trustworthy hash is evidence of
-// equality, but a non-matching (or absent) hash is NEVER treated as proof of
-// difference unless the sizes actually differ.
-func (p *planner) compare(rel, remotePath string, le LocalEntry, ce RemoteEntry) (PlannedAction, bool) {
-	base := PlannedAction{
-		RelPath:    rel,
-		RemotePath: remotePath,
-		LocalPath:  le.AbsPath,
-		LocalSize:  le.Size,
-		LocalMtime: le.Mtime,
-		Size:       le.Size,
-		IsDir:      false,
-	}
-
-	// A file modified very recently is worth flagging, but not worth refusing:
-	// in a manually triggered tool the most likely reason a file was touched in
-	// the last couple of minutes is that the user just finished editing it and
-	// came here to back it up. The real protection against a half-written file
-	// is CheckLocalUnchanged, which re-compares the size and mtime snapshot at
-	// execution time and skips anything that moved.
-	base.Stable = !IsEditing(le, p.now, p.opt.EditingWindow)
-	unstabilityNote := ""
-	if !base.Stable {
-		unstabilityNote = fmt.Sprintf("; 注意: 本地文件在最近 %s 内被修改过, 执行前会重新校验大小与修改时间",
-			p.opt.EditingWindow)
-	}
-	// finish attaches the instability note to whatever reason the rule produces.
-	finish := func(a PlannedAction) PlannedAction {
-		if unstabilityNote != "" {
-			a.Reason += unstabilityNote
+func (p *cleanupPlanner) excluded(ce RemoteEntry) bool {
+	opt := LocalScanOptions{SkipSuffixes: p.opt.SkipSuffixes, SkipNames: p.opt.SkipNames, SkipPrefixes: p.opt.SkipPrefixes}
+	for _, name := range strings.Split(RelPath(p.scan.Root, ce.Path), "/") {
+		if shouldSkipLocal(name, opt) {
+			return true
 		}
-		a.Stable = base.Stable
-		return a
 	}
-
-	// Sizes differ: the content provably differs, no hash needed.
-	if le.Size != ce.Size {
-		base.Kind = ActionReplace
-		base.Rule = RuleSizeDiffers
-		base.Reason = fmt.Sprintf("大小不同 (本地 %d / 云端 %d)", le.Size, ce.Size)
-		return finish(base), false
-	}
-
-	// Sizes agree. Only a trustworthy server hash can prove equality.
-	if ce.ContentMD5Trusted && ce.ContentMD5 != "" {
-		localHash, err := LocalContentHash(le.AbsPath)
-		if err != nil {
-			base.Kind = ActionConflict
-			base.Reason = "无法读取本地文件以校验哈希: " + err.Error()
-			return base, false
-		}
-		// Re-check that the file did not change while hashing it, so a file
-		// being written is not mistaken for a stable one.
-		if localHash.Size != le.Size {
-			base.Kind = ActionConflict
-			base.Reason = "本地文件在校验期间大小发生变化, 可能正在写入"
-			return base, false
-		}
-		if strings.EqualFold(localHash.MD5, ce.ContentMD5) {
-			base.Kind = ActionKeep
-			base.Rule = RuleHashMatch
-			base.Reason = "内容哈希一致"
-			return finish(base), true
-		}
-		base.Kind = ActionReplace
-		base.Rule = RuleHashMismatch
-		base.Reason = "服务端可信哈希与本地内容不一致 (大小相同但内容不同)"
-		return finish(base), false
-	}
-
-	// No trustworthy hash: sizes matching is the only agreement, and it does
-	// not prove the contents match.
-	base.Rule = RuleSizeOnlyEqual
-	if p.opt.Conservative {
-		base.Kind = ActionConflict
-		base.Reason = "大小相同但服务端哈希不可信, 无法证明内容一致 (按 --conservative 保留待确认)"
-		return base, false
-	}
-	base.Kind = ActionReplace
-	base.Reason = "大小相同但服务端哈希不可信, 无法排除内容不同, 保守起见重新上传覆盖"
-	return finish(base), false
+	return false
 }
 
-// classifyCloudOnly decides REMOVE for cloud entries with no local counterpart.
-//
-// The important subtlety: a cloud directory with no local directory of the same
-// path is removed as a whole, so its children must not also be planned. More
-// importantly, an entry named like an excluded local file (for example a .tmp
-// that the local scan deliberately skipped) must NOT be removed, because its
-// local counterpart may well exist and simply be excluded from the scan.
-func (p *planner) classifyCloudOnly() {
-	localRels := p.local.Entries
-
-	// Ancestors that exist locally: anything beneath them must be decided by
-	// recursing, not by a wholesale directory removal.
-	paths := make([]string, 0, len(p.scan.Entries))
-	for abs := range p.scan.Entries {
-		paths = append(paths, abs)
+func (p *cleanupPlanner) classifyExtras() {
+	skipped := 0
+	protectedDirs := make(map[string]bool)
+	type counts struct {
+		files int
+		bytes int64
 	}
-	sort.Strings(paths)
-
-	// Collect cloud directories that will be removed wholesale so children can
-	// be skipped.
+	totals := make(map[string]counts)
+	for abs, ce := range p.scan.Entries {
+		protected := p.protected[abs] || p.sources[abs] || p.excluded(ce) || p.scan.UnsafeNames[abs] != ""
+		if _, local := p.local.Entries[RelPath(p.scan.Root, abs)]; local {
+			protected = true
+		}
+		for parent := ParentRemote(abs); parent != p.scan.Root && parent != "/"; parent = ParentRemote(parent) {
+			if protected {
+				protectedDirs[parent] = true
+			}
+			if !ce.IsDir {
+				t := totals[parent]
+				t.files++
+				t.bytes += ce.Size
+				totals[parent] = t
+			}
+		}
+	}
 	removedDirs := make(map[string]bool)
-	for _, abs := range paths {
-		ce := p.scan.Entries[abs]
-		if !ce.IsDir {
-			continue
-		}
-		rel := RelPath(p.scan.Root, abs)
-		if rel == "" {
-			continue
-		}
-		if _, ok := localRels[rel]; ok {
-			continue
-		}
-		// A cloud-only directory is removed as one unit.
-		removedDirs[abs] = true
-	}
-
+	paths := append([]string(nil), p.scan.Order...)
+	sort.Strings(paths)
 	for _, abs := range paths {
 		ce := p.scan.Entries[abs]
 		rel := RelPath(p.scan.Root, abs)
-		if rel == "" {
+		if _, exists := p.local.Entries[rel]; exists {
 			continue
 		}
-		if _, ok := localRels[rel]; ok {
-			continue // handled by classifyLocal
+		protected := false
+		for ancestor := abs; ancestor != p.scan.Root && ancestor != "/"; ancestor = ParentRemote(ancestor) {
+			if p.protected[ancestor] || p.scan.UnsafeNames[ancestor] != "" && ancestor != abs {
+				protected = true
+				break
+			}
 		}
-		// A directory whose listing FAILED is not "empty and redundant": we
-		// never saw inside it. Removing it would move unread content into
-		// quarantine, so it is left alone and reported instead.
-		if p.isUnreadDir(abs, ce) {
-			p.plan.Conflicts = append(p.plan.Conflicts, PlannedAction{
-				Kind: ActionConflict, RelPath: rel, RemotePath: abs, IsDir: ce.IsDir,
-				Reason: "该目录枚举失败, 内容未经确认, 不会自动清理",
-			})
+		if p.excluded(ce) {
+			skipped++
 			continue
 		}
-		// Anything beneath a directory that is itself being removed has been
-		// accounted for by that removal. This must be checked BEFORE the
-		// directory branch, or a nested cloud-only directory would also be
-		// listed as its own redundant removal.
-		if p.insideRemovedDir(abs, removedDirs) {
+		if protected || p.sources[abs] {
 			continue
 		}
-		// Skipped by an exclusion rule locally? Then its local counterpart may
-		// exist but is excluded, so leave the cloud copy alone.
-		if p.excludedLocally(ce) {
-			p.plan.SkipNotices = append(p.plan.SkipNotices, fmt.Sprintf(
-				"云端 %s 与本地排除规则匹配, 已保留不删 (如确需清理请显式指定)", abs))
+		if p.scan.UnsafeNames[abs] != "" {
+			p.plan.Conflicts = append(p.plan.Conflicts, PlannedAction{Kind: ActionConflict, RelPath: rel, RemotePath: abs, Reason: "云端名称无法映射，保留此项"})
 			continue
+		}
+		inside := false
+		for parent := ParentRemote(abs); parent != p.scan.Root && parent != "/"; parent = ParentRemote(parent) {
+			if removedDirs[parent] {
+				inside = true
+				break
+			}
+		}
+		if inside {
+			continue
+		}
+		if ce.IsDir && protectedDirs[abs] {
+			continue
+		}
+		a := PlannedAction{Kind: ActionRemove, RelPath: rel, RemotePath: abs, Size: ce.Size, IsDir: ce.IsDir, Reason: "本地不存在，移入网盘回收站"}
+		if owner := p.owners[abs]; owner != "" {
+			dep, ok := p.dependencies[owner]
+			if !ok {
+				continue
+			}
+			a.Requires = dep.RemotePath
+			a.Hash = dep.Hash
+			a.LocalPath = dep.LocalPath
+			a.LocalSize = dep.LocalSize
+			a.LocalMtime = dep.LocalMtime
+			a.LocalMtimeNano = dep.LocalMtimeNano
+			a.Reason = "历史副本；确认本地对应版本在云端就位后移入回收站"
 		}
 		if ce.IsDir {
-			if !removedDirs[abs] {
-				continue
-			}
-			p.plan.Removes = append(p.plan.Removes, PlannedAction{
-				Kind: ActionRemove, RelPath: rel, RemotePath: abs, IsDir: true,
-				Reason: "云端存在同名目录, 本地没有 (整个目录移入隔离区)",
-			})
-			continue
-		}
-		if _, unsafe := p.scan.UnsafeNames[abs]; unsafe {
-			p.plan.Conflicts = append(p.plan.Conflicts, PlannedAction{
-				Kind: ActionConflict, RelPath: rel, RemotePath: abs, Size: ce.Size,
-				Reason: "云端名称无法在 Windows 忠实映射, 本地不可能有对应项, 但不会按名自动删除",
-			})
-			continue
-		}
-		p.plan.Removes = append(p.plan.Removes, PlannedAction{
-			Kind: ActionRemove, RelPath: rel, RemotePath: abs, Size: ce.Size,
-			Reason: "云端存在, 本地没有",
-		})
-	}
-
-	sortActions(p.plan.Removes)
-}
-
-// isUnreadDir reports whether a cloud entry is a directory whose own listing
-// failed, or whose subtree contained a failed listing.
-//
-// Such a directory must never be planned for removal: its contents were never
-// enumerated, so "not present locally" cannot be established for them.
-func (p *planner) isUnreadDir(abs string, ce RemoteEntry) bool {
-	if len(p.scan.Stats.Errors) == 0 {
-		return false
-	}
-	for _, e := range p.scan.Stats.Errors {
-		if e.Path == abs {
-			return true
-		}
-		// A failed descendant also makes this directory untrustworthy, but only
-		// if the entry is directory-like; a file has no descendants.
-		if ce.IsDir && strings.HasPrefix(e.Path, abs+"/") {
-			return true
-		}
-	}
-	return false
-}
-
-// excludedLocally reports whether a cloud name matches the local exclusion
-// rules, meaning the local scan would have skipped its counterpart.
-func (p *planner) excludedLocally(ce RemoteEntry) bool {
-	opt := LocalScanOptions{
-		SkipSuffixes: p.opt.SkipSuffixes,
-		SkipNames:    p.opt.SkipNames,
-		SkipPrefixes: p.opt.SkipPrefixes,
-	}
-	return shouldSkipLocal(ce.Name, opt)
-}
-
-func (p *planner) insideRemovedDir(abs string, removedDirs map[string]bool) bool {
-	for dir := range removedDirs {
-		if strings.HasPrefix(abs, dir+"/") {
-			return true
-		}
-	}
-	return false
-}
-
-// detectCloudAliases looks for the pathological case where the cloud reports
-// two entries with the same normalised path. The scanner keys by path, so one
-// would silently overwrite the other.
-func (p *planner) detectCloudAliases() {
-	seen := make(map[string]string, len(p.scan.Order))
-	dupes := map[string]int{}
-	for _, abs := range p.scan.Order {
-		if prev, ok := seen[abs]; ok {
-			_ = prev
-			dupes[abs]++
-			continue
-		}
-		seen[abs] = abs
-	}
-	for abs, n := range dupes {
-		p.plan.Conflicts = append(p.plan.Conflicts, PlannedAction{
-			Kind: ActionConflict, RelPath: RelPath(p.scan.Root, abs), RemotePath: abs,
-			Reason: fmt.Sprintf("云端返回了 %d 个规范化后相同的路径, 映射存在歧义, 本次全部不处理", n+1),
-		})
-	}
-}
-
-func (p *planner) finalize() {
-	sortActions(p.plan.Uploads)
-	sortActions(p.plan.Replaces)
-	sortActions(p.plan.Mkdirs)
-	sortActions(p.plan.Keeps)
-	sortActions(p.plan.Conflicts)
-
-	// A local file that has no cloud counterpart needs every missing ancestor
-	// directory created first.
-	if len(p.plan.Uploads) > 0 || len(p.plan.Replaces) > 0 {
-		// Only uploads can require new directories; a replace implies the path
-		// already exists.
-		need := map[string]bool{}
-		for _, a := range p.plan.Uploads {
-			for _, dir := range missingAncestors(p, a.RelPath) {
-				need[dir] = true
+			removedDirs[abs] = true
+			a.Size = totals[abs].bytes
+			a.RemovedFiles = totals[abs].files
+			a.WholeDir = p.scan.PrunedDirs[abs]
+			if a.WholeDir {
+				a.Reason = "本地无此目录：连同全部内容一次移入回收站；未扫描内部文件，数量与容量未知"
 			}
 		}
-		dirs := make([]string, 0, len(need))
-		for dir := range need {
-			dirs = append(dirs, dir)
-		}
-		sort.Strings(dirs)
-		for _, dir := range dirs {
-			if p.dirsSet[dir] {
-				continue
-			}
-			p.dirsSet[dir] = true
-			p.plan.Mkdirs = append(p.plan.Mkdirs, PlannedAction{
-				Kind: ActionMkdir, RelPath: dir, RemotePath: JoinRemote(p.scan.Root, dir),
-				IsDir: true, Reason: "上传前创建缺失的云端目录",
-			})
-		}
-		sortActions(p.plan.Mkdirs)
+		p.plan.Removes = append(p.plan.Removes, a)
 	}
-
-	p.plan.UploadDirCount = len(p.plan.Mkdirs)
+	if skipped > 0 {
+		p.plan.SkipNotices = append(p.plan.SkipNotices, fmt.Sprintf("保留 %d 个符合排除规则的云端条目", skipped))
+	}
 }
 
-// missingAncestors returns the relative directories on the path to rel that do
-// not exist on the cloud yet, outermost first.
-func missingAncestors(p *planner, rel string) []string {
-	var out []string
-	parts := strings.Split(strings.Trim(rel, "/"), "/")
-	if len(parts) <= 1 {
-		return nil
-	}
-	cur := ""
-	for _, part := range parts[:len(parts)-1] {
-		if cur == "" {
-			cur = part
-		} else {
-			cur = cur + "/" + part
-		}
-		abs := JoinRemote(p.scan.Root, cur)
-		entry, ok := p.scan.Entries[abs]
-		if ok && entry.IsDir {
-			continue
-		}
-		out = append(out, cur)
-	}
-	return out
-}
-
-// planMkdir records that a local directory is absent on the cloud. The Mkdir
-// list is rebuilt in finalize from the uploads' missing ancestors, so this only
-// needs to be recorded when it is a leaf directory (an empty local directory
-// still needs creating to be mirrored).
-func (p *planner) planMkdir(rel, remotePath string) {
-	if rel == "" {
-		return
-	}
-	if p.dirsSet[rel] {
-		return
-	}
-	p.dirsSet[rel] = true
-	p.plan.Mkdirs = append(p.plan.Mkdirs, PlannedAction{
-		Kind: ActionMkdir, RelPath: rel, RemotePath: remotePath, IsDir: true,
-		Reason: "本地存在、云端缺失的目录 (含空目录)",
-	})
-}
-
-func (p *planner) upload(rel, remotePath string, le LocalEntry) {
-	stable := !IsEditing(le, p.now, p.opt.EditingWindow)
-	reason := "云端缺失"
-	if !stable {
-		reason = "云端缺失; 注意: 本地文件刚被修改过, 执行前会重新校验"
-	}
-	p.plan.Uploads = append(p.plan.Uploads, PlannedAction{
-		Kind: ActionUpload, RelPath: rel, RemotePath: remotePath, LocalPath: le.AbsPath,
-		LocalSize: le.Size, LocalMtime: le.Mtime,
-		Size: le.Size, Reason: reason, Stable: stable,
-	})
-}
-
-func (p *planner) conflict(rel, remotePath, localPath, reason string) {
-	p.plan.Conflicts = append(p.plan.Conflicts, PlannedAction{
-		Kind: ActionConflict, RelPath: rel, RemotePath: remotePath, LocalPath: localPath,
-		Reason: reason,
-	})
-}
-
-func sortActions(actions []PlannedAction) {
-	sort.Slice(actions, func(i, j int) bool {
-		if actions[i].RelPath != actions[j].RelPath {
-			return actions[i].RelPath < actions[j].RelPath
-		}
-		return actions[i].RemotePath < actions[j].RemotePath
-	})
+func sortActions(a []PlannedAction) {
+	sort.Slice(a, func(i, j int) bool { return a[i].RelPath < a[j].RelPath })
 }

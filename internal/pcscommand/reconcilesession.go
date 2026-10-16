@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 // planning and applying. Nothing here renders or prompts - callers decide how to
 // present progress, which is what keeps the GUI decoupled from the safety logic.
 type ReconcileSession struct {
+	Progress reconcile.ProgressFunc
 	// Observer receives progress lines. Nil discards them.
 	Observer func(string)
 }
@@ -79,6 +81,7 @@ func (s *ReconcileSession) Probe(opt ReconcileProbeOptions) (*reconcile.ProbeRep
 
 	s.log(fmt.Sprintf("只读探测: remote=%s local=%s", opt.RemoteRoot, opt.LocalDir))
 	fs := reconcile.NewRemoteFS(GetBaiduPCS())
+	fs.Log = s.log
 	info := &reconcile.UserInfo{}
 	if u := GetActiveUser(); u != nil {
 		info.Name, info.UID = u.Name, u.UID
@@ -90,6 +93,7 @@ func (s *ReconcileSession) Probe(opt ReconcileProbeOptions) (*reconcile.ProbeRep
 		DiscoverRoots: opt.DiscoverRoots,
 		Redact:        opt.Redact,
 		ShallowScan:   opt.ShallowScan,
+		Limits:        reconcile.ScanLimits{Workers: 4, Progress: s.Progress},
 	})
 	if err != nil {
 		return nil, err
@@ -112,7 +116,13 @@ func (s *ReconcileSession) Plan(opt ReconcilePlanOptions) (*reconcile.PlanReport
 
 	s.log(fmt.Sprintf("扫描两端: local=%s remote=%s", opt.LocalRoot, opt.RemoteRoot))
 	started := time.Now()
-	plan, err := reconcile.BuildPlan(reconcile.NewRemoteFS(GetBaiduPCS()), reconcile.PlanOptions{
+	cachePath := filepath.Join(pcsconfig.GetConfigDir(), "reconcile-hashes.json")
+	cache := reconcile.LoadHashCache(cachePath)
+	fs := reconcile.NewRemoteFS(GetBaiduPCS())
+	fs.Log = s.log
+	plan, err := reconcile.BuildPlan(fs, reconcile.PlanOptions{
+		Progress: s.Progress, HashCache: cache, UseHashCache: !opt.HashFiles,
+		Limits:       reconcile.ScanLimits{Workers: 4},
 		LocalRoot:    opt.LocalRoot,
 		RemoteRoot:   opt.RemoteRoot,
 		HashFiles:    opt.HashFiles,
@@ -123,7 +133,11 @@ func (s *ReconcileSession) Plan(opt ReconcilePlanOptions) (*reconcile.PlanReport
 	if err != nil {
 		return nil, nil, err
 	}
+	if err := cache.Save(cachePath); err != nil {
+		s.log("哈希缓存保存失败，下次将重新计算")
+	}
 	s.log(fmt.Sprintf("扫描完成, 用时 %s", time.Since(started).Round(time.Second)))
+	s.log(fmt.Sprintf("本次内容读取 %d 字节，复用 %d 个哈希缓存，云端目录请求 %d 次；待重命名 %d，待清理 %d，等待官方备份 %d", plan.Performance.HashBytes, plan.Performance.CacheHits, plan.Performance.CloudListings, len(plan.Renames), len(plan.Removes), len(plan.Pending)))
 	return reconcile.BuildPlanReport(plan, "plan (只读预览)"), plan, nil
 }
 
@@ -161,8 +175,8 @@ func (s *ReconcileSession) Apply(opt ApplyOptions) (*reconcile.ApplyReport, erro
 	mode := reconcile.RemovalMode(strings.ToLower(strings.TrimSpace(opt.RemovalMode)))
 	switch mode {
 	case "":
-		mode = reconcile.RemovalQuarantine
-	case reconcile.RemovalQuarantine, reconcile.RemovalRecycle:
+		mode = reconcile.RemovalRecycle
+	case reconcile.RemovalRecycle:
 	default:
 		return nil, fmt.Errorf("未知的清理方式 %q", opt.RemovalMode)
 	}
@@ -172,7 +186,8 @@ func (s *ReconcileSession) Apply(opt ApplyOptions) (*reconcile.ApplyReport, erro
 
 	s.log(fmt.Sprintf("开始执行 (清理方式: %s)", mode))
 	writer := reconcile.NewRemoteWriter(GetBaiduPCS())
-	executor := &reconcile.Executor{Writer: writer, Log: s.log}
+	writer.Log = s.log
+	executor := &reconcile.Executor{Writer: writer, Log: s.log, Progress: s.Progress}
 
 	return executor.Apply(opt.Plan, reconcile.ApplyOptions{
 		PlanOptions: reconcile.PlanOptions{

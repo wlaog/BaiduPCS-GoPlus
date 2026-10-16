@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/qjfoidnh/BaiduPCS-Go/internal/reconcile"
 )
@@ -98,15 +99,57 @@ func TestGuiRejectsOverlappingCloudOperations(t *testing.T) {
 	}
 }
 
-func TestGuiFailedApplyConsumesPlan(t *testing.T) {
+func TestGuiPreflightFailurePreservesPreview(t *testing.T) {
 	session := &GuiSession{plan: &reconcile.Plan{}}
 	rec := httptest.NewRecorder()
 	session.handleApply(rec, httptest.NewRequest(http.MethodPost, "/api/apply", strings.NewReader("{}")))
-	if session.plan != nil {
-		t.Fatal("failed apply must require a fresh preview")
+	if session.plan == nil || session.report == nil {
+		t.Fatal("preflight failure must preserve the expensive preview")
 	}
 	data, _ := io.ReadAll(rec.Body)
-	if !strings.Contains(string(data), `"ok":false`) {
+	if !strings.Contains(string(data), `"ok":false`) || !strings.Contains(string(data), `"remainingReport":{`) {
 		t.Fatal("invalid test plan must not execute")
+	}
+}
+
+func TestGuiProgressPollingRemainsAvailableDuringOperation(t *testing.T) {
+	session := &GuiSession{token: "test"}
+	started, release := make(chan struct{}), make(chan struct{})
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/plan", session.protected(session.operation(func(w http.ResponseWriter, r *http.Request) {
+		session.observeProgress(reconcile.Progress{Phase: "hash", Current: "a.bin", Done: 2, Total: 8, Bytes: 1024})
+		close(started)
+		<-release
+		session.writeJSON(w, map[string]bool{"ok": true})
+	})))
+	mux.HandleFunc("/api/log", session.protected(session.handleLog))
+	server := httptest.NewServer(mux)
+	defer func() { close(release); server.Close() }()
+	go func() {
+		res, err := http.Post(server.URL+"/api/plan?token=test", "application/json", strings.NewReader("{}"))
+		if err == nil {
+			res.Body.Close()
+		}
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("operation did not start")
+	}
+	client := &http.Client{Timeout: time.Second}
+	res, err := client.Get(server.URL + "/api/log?token=test")
+	if err != nil {
+		t.Fatal("poll blocked behind operation:", err)
+	}
+	defer res.Body.Close()
+	var payload struct {
+		Progress guiProgress `json:"progress"`
+		Lines    []string    `json:"lines"`
+	}
+	if err = json.NewDecoder(res.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if !payload.Progress.Running || payload.Progress.Done != 2 || payload.Progress.Total != 8 || len(payload.Lines) == 0 {
+		t.Fatal("poll must expose live progress and logs")
 	}
 }
