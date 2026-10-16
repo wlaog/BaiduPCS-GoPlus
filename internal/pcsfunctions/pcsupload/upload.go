@@ -2,15 +2,17 @@ package pcsupload
 
 import (
 	"context"
-	"github.com/felixonmars/BaiduPCS-Go/baidupcs"
-	"github.com/felixonmars/BaiduPCS-Go/baidupcs/pcserror"
-	"github.com/felixonmars/BaiduPCS-Go/internal/pcsconfig"
-	"github.com/felixonmars/BaiduPCS-Go/requester"
-	"github.com/felixonmars/BaiduPCS-Go/requester/multipartreader"
-	"github.com/felixonmars/BaiduPCS-Go/requester/rio"
-	"github.com/felixonmars/BaiduPCS-Go/requester/uploader"
+	"github.com/qjfoidnh/BaiduPCS-Go/baidupcs"
+	"github.com/qjfoidnh/BaiduPCS-Go/baidupcs/pcserror"
+	"github.com/qjfoidnh/BaiduPCS-Go/internal/pcsconfig"
+	"github.com/qjfoidnh/BaiduPCS-Go/requester"
+	"github.com/qjfoidnh/BaiduPCS-Go/requester/multipartreader"
+	"github.com/qjfoidnh/BaiduPCS-Go/requester/rio"
+	"github.com/qjfoidnh/BaiduPCS-Go/requester/uploader"
 	"io"
 	"net/http"
+	"sync"
+	"time"
 )
 
 type (
@@ -22,6 +24,22 @@ type (
 	EmptyReaderLen64 struct {
 	}
 )
+
+var (
+    uploadClient     *requester.HTTPClient
+    uploadClientOnce sync.Once
+)
+
+func getUploadClient(jar http.CookieJar) *requester.HTTPClient {
+    uploadClientOnce.Do(func() {
+        uploadClient = pcsconfig.Config.PCSHTTPClient()
+        uploadClient.SetCookiejar(jar)
+        uploadClient.SetTimeout(200 * time.Second)
+    })
+    return uploadClient
+}
+
+var pcsPeriod = 256 // 上传多少个分片更换一次pcsHost
 
 func (e EmptyReaderLen64) Read(p []byte) (n int, err error) {
 	return 0, io.EOF
@@ -44,19 +62,28 @@ func (pu *PCSUpload) lazyInit() {
 	}
 }
 
-// Precreate do nothing
-func (pu *PCSUpload) Precreate() (err error) {
-	return nil
+// Precreate 上传前准备, 获取本次上传用的pcs服务器
+func (pu *PCSUpload) Precreate() (originPCSHost string, pcsError pcserror.Error) {
+	originPCSHost = pu.pcs.GetPCSAddr()
+	_, newPCSHost := pu.pcs.GetRandomPCSHost()
+	pu.pcs.SetPCSAddr(newPCSHost)
+	return
 }
 
-func (pu *PCSUpload) TmpFile(ctx context.Context, partseq int, partOffset int64, r rio.ReaderLen64) (checksum string, uperr error) {
+func (pu *PCSUpload) TmpFile(ctx context.Context, uploadId, targetPath string, partSeq int, partOffset int64, r rio.ReaderLen64) (checksum string, uperr error) {
 	pu.lazyInit()
 
 	var respErr *uploader.MultiError
-	checksum, pcsError := pu.pcs.UploadTmpFile(func(uploadURL string, jar http.CookieJar) (resp *http.Response, err error) {
-		client := pcsconfig.Config.PCSHTTPClient()
-		client.SetCookiejar(jar)
-		client.SetTimeout(0)
+
+	// 每上传一定量分片切换一次动态pcs addr
+	if partSeq%pcsPeriod == pcsPeriod-1 {
+		go func() {
+			_, newPCSHost := pu.pcs.GetRandomPCSHost()
+			pu.pcs.SetPCSAddr(newPCSHost)
+		}()
+	}
+
+	checksum, pcsError := pu.pcs.UploadTmpFile(uploadId, targetPath, partSeq, partOffset, func(uploadURL string, jar http.CookieJar) (resp *http.Response, err error) {
 
 		mr := multipartreader.NewMultipartReader()
 		mr.AddFormFile("uploadedfile", "", r)
@@ -64,13 +91,14 @@ func (pu *PCSUpload) TmpFile(ctx context.Context, partseq int, partOffset int64,
 
 		doneChan := make(chan struct{}, 1)
 		go func() {
-			resp, err = client.Req(http.MethodPost, uploadURL, mr, nil)
+			cli := getUploadClient(jar)
+			resp, err = cli.Req(http.MethodPost, uploadURL, mr, nil)
 			doneChan <- struct{}{}
 
 			if resp != nil {
 				// 不可恢复的错误
 				switch resp.StatusCode {
-				case 400, 401, 403, 413:
+				case 400, 401, 403, 413: // 4xx通常是由客户端非法操作引发，直接深度重试
 					respErr = &uploader.MultiError{
 						Terminated: true,
 					}
@@ -95,25 +123,8 @@ func (pu *PCSUpload) TmpFile(ctx context.Context, partseq int, partOffset int64,
 	return checksum, pcsError
 }
 
-func (pu *PCSUpload) CreateSuperFile(checksumList ...string) (err error) {
+func (pu *PCSUpload) CreateSuperFile(pcsHost, policy, uploadId string, fileSize int64, checksumMap map[int]string) (err error) {
 	pu.lazyInit()
-
-	// 先在网盘目标位置, 上传一个空文件
-	// 防止出现file does not exist
-	pcsError := pu.pcs.Upload(pu.targetPath, func(uploadURL string, jar http.CookieJar) (resp *http.Response, err error) {
-		mr := multipartreader.NewMultipartReader()
-		mr.AddFormFile("file", "file", &EmptyReaderLen64{})
-		mr.CloseMultipart()
-
-		c := requester.NewHTTPClient()
-		c.SetCookiejar(jar)
-		return c.Req(http.MethodPost, uploadURL, mr, nil)
-	})
-	if pcsError != nil {
-		// 修改操作
-		pcsError.(*pcserror.PCSErrInfo).Operation = baidupcs.OperationUploadCreateSuperFile
-		return pcsError
-	}
-
-	return pu.pcs.UploadCreateSuperFile(false, pu.targetPath, checksumList...)
+	pu.pcs.SetPCSAddr(pcsHost) // 恢复默认pcs服务器
+	return pu.pcs.UploadCreateSuperFile(uploadId, policy, fileSize, pu.targetPath, checksumMap)
 }

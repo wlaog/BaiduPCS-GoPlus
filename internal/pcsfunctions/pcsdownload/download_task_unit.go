@@ -3,23 +3,24 @@ package pcsdownload
 import (
 	"errors"
 	"fmt"
-	"github.com/felixonmars/BaiduPCS-Go/baidupcs"
-	"github.com/felixonmars/BaiduPCS-Go/baidupcs/pcserror"
-	"github.com/felixonmars/BaiduPCS-Go/internal/pcsconfig"
-	"github.com/felixonmars/BaiduPCS-Go/internal/pcsfunctions"
-	"github.com/felixonmars/BaiduPCS-Go/pcstable"
-	"github.com/felixonmars/BaiduPCS-Go/pcsutil/converter"
-	"github.com/felixonmars/BaiduPCS-Go/pcsutil/taskframework"
-	"github.com/felixonmars/BaiduPCS-Go/pcsverbose"
-	"github.com/felixonmars/BaiduPCS-Go/requester"
-	"github.com/felixonmars/BaiduPCS-Go/requester/downloader"
-	"github.com/felixonmars/BaiduPCS-Go/requester/transfer"
+	"github.com/qjfoidnh/BaiduPCS-Go/baidupcs"
+	"github.com/qjfoidnh/BaiduPCS-Go/baidupcs/pcserror"
+	"github.com/qjfoidnh/BaiduPCS-Go/internal/pcsconfig"
+	"github.com/qjfoidnh/BaiduPCS-Go/internal/pcsfunctions"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcstable"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil/converter"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil/taskframework"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsverbose"
+	"github.com/qjfoidnh/BaiduPCS-Go/requester"
+	"github.com/qjfoidnh/BaiduPCS-Go/requester/downloader"
+	"github.com/qjfoidnh/BaiduPCS-Go/requester/transfer"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -44,13 +45,15 @@ type (
 		IsExecutedPermission bool // 下载成功后是否加上执行权限
 		IsOverwrite          bool // 是否覆盖已存在的文件
 		NoCheck              bool // 不校验文件
+		DlinkPrefer          int  // 使用所有备选下载链接中的第几个链接
+		ModifyMTime          bool // 下载的文件mtime修改为与网盘一致
 
 		DownloadMode DownloadMode // 下载模式
 
 		PcsPath  string // 要下载的网盘文件路径
 		SavePath string // 保存的路径
 
-		fileInfo *baidupcs.FileDirectory // 文件或目录详情
+		FileInfo *baidupcs.FileDirectory // 文件或目录详情
 	}
 )
 
@@ -67,6 +70,8 @@ const (
 	StrDownloadGetDlinkFailed = "获取下载链接失败"
 	// StrDownloadChecksumFailed 检测文件有效性失败
 	StrDownloadChecksumFailed = "检测文件有效性失败"
+	// StrDownloadCheckLengthFailed 检测文件大小一致性失败
+	StrDownloadCheckLengthFailed = "检测文件大小一致性失败"
 	// DefaultDownloadMaxRetry 默认下载失败最大重试次数
 	DefaultDownloadMaxRetry = 3
 )
@@ -75,6 +80,11 @@ const (
 	DownloadModeLocate DownloadMode = iota
 	DownloadModePCS
 	DownloadModeStreaming
+)
+
+var (
+    panClient     *requester.HTTPClient
+    panClientOnce sync.Once
 )
 
 func (dtu *DownloadTaskUnit) SetTaskInfo(info *taskframework.TaskInfo) {
@@ -87,6 +97,14 @@ func (dtu *DownloadTaskUnit) verboseInfof(format string, a ...interface{}) {
 	}
 }
 
+// removeEmptyDownloadFile 删除 0 字节的残缺下载文件
+func removeEmptyDownloadFile(path string) {
+	info, statErr := os.Stat(path)
+	if statErr == nil && info.Size() == 0 {
+		_ = os.Remove(path)
+	}
+}
+
 // download 执行下载
 func (dtu *DownloadTaskUnit) download(downloadURL string, client *requester.HTTPClient) (err error) {
 	var (
@@ -95,6 +113,13 @@ func (dtu *DownloadTaskUnit) download(downloadURL string, client *requester.HTTP
 	)
 
 	if !dtu.Cfg.IsTest {
+		// panic 时清理空文件并转为可重试错误，避免整进程退出
+		defer func() {
+			if r := recover(); r != nil {
+				removeEmptyDownloadFile(dtu.SavePath)
+				err = fmt.Errorf("%s: panic: %v", StrDownloadFailed, r)
+			}
+		}()
 		// 非测试下载
 		dtu.Cfg.InstanceStatePath = dtu.SavePath + DownloadSuffix
 
@@ -124,6 +149,7 @@ func (dtu *DownloadTaskUnit) download(downloadURL string, client *requester.HTTP
 	der := downloader.NewDownloader(downloadURL, writer, dtu.Cfg)
 	der.SetClient(client)
 	der.SetDURLCheckFunc(BaiduPCSURLCheckFunc)
+	//der.SetFileContentLength(dtu.FileInfo.Size)
 	der.SetStatusCodeBodyCheckFunc(func(respBody io.Reader) error {
 		// 返回的错误可能是pcs的json
 		// 解析错误
@@ -143,7 +169,7 @@ func (dtu *DownloadTaskUnit) download(downloadURL string, client *requester.HTTP
 		if dtu.IsPrintStatus {
 			// 输出所有的worker状态
 			var (
-				tb      = pcstable.NewTable(builder)
+				tb = pcstable.NewTable(builder)
 			)
 			tb.SetHeader([]string{"#", "status", "range", "left", "speeds", "error"})
 			workersCallback(func(key int, worker *downloader.Worker) bool {
@@ -166,7 +192,7 @@ func (dtu *DownloadTaskUnit) download(downloadURL string, client *requester.HTTP
 			leftStr = left.String()
 		}
 
-		fmt.Fprintf(builder,dtu.PrintFormat, dtu.taskInfo.Id(),
+		fmt.Fprintf(builder, dtu.PrintFormat, dtu.taskInfo.Id(),
 			converter.ConvertFileSize(status.Downloaded(), 2),
 			converter.ConvertFileSize(status.TotalSize(), 2),
 			converter.ConvertFileSize(status.SpeedsPerSecond(), 2),
@@ -193,14 +219,10 @@ func (dtu *DownloadTaskUnit) download(downloadURL string, client *requester.HTTP
 		// 下载发生错误
 		if !dtu.Cfg.IsTest {
 			// 下载失败, 删去空文件
-			if info, infoErr := file.Stat(); infoErr == nil {
-				if info.Size() == 0 {
-					// 空文件, 应该删除
-					dtu.verboseInfof("[%s] remove empty file: %s\n", dtu.taskInfo.Id(), dtu.SavePath)
-					removeErr := os.Remove(dtu.SavePath)
-					if removeErr != nil {
-						dtu.verboseInfof("[%s] remove file error: %s\n", dtu.taskInfo.Id(), removeErr)
-					}
+			if info, infoErr := file.Stat(); infoErr == nil && info.Size() == 0 {
+				dtu.verboseInfof("[%s] remove empty file: %s\n", dtu.taskInfo.Id(), dtu.SavePath)
+				if removeErr := os.Remove(dtu.SavePath); removeErr != nil {
+					dtu.verboseInfof("[%s] remove file error: %s\n", dtu.taskInfo.Id(), removeErr)
 				}
 			}
 		}
@@ -224,22 +246,24 @@ func (dtu *DownloadTaskUnit) download(downloadURL string, client *requester.HTTP
 	return nil
 }
 
-//panHTTPClient 获取包含特定User-Agent的HTTPClient
-func (dtu *DownloadTaskUnit) panHTTPClient() (client *requester.HTTPClient) {
-	client = pcsconfig.Config.PanHTTPClient()
-	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		// 去掉 Referer
-		if !pcsconfig.Config.EnableHTTPS {
-			req.Header.Del("Referer")
-		}
-		if len(via) >= 10 {
-			return errors.New("stopped after 10 redirects")
-		}
-		return nil
-	}
-	client.SetTimeout(20 * time.Minute)
-	client.SetKeepAlive(true)
-	return client
+// panHTTPClient 获取包含特定User-Agent的HTTPClient
+func (dtu *DownloadTaskUnit) panHTTPClient() *requester.HTTPClient {
+    panClientOnce.Do(func() {
+        panClient = pcsconfig.Config.PanHTTPClient()
+        panClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+            // 去掉 Referer
+            if !pcsconfig.Config.EnableHTTPS {
+                req.Header.Del("Referer")
+            }
+            if len(via) >= 10 {
+                return errors.New("stopped after 10 redirects")
+            }
+            return nil
+        }
+        panClient.SetTimeout(6 * time.Minute)
+        panClient.SetKeepAlive(true)
+    })
+    return panClient
 }
 
 func (dtu *DownloadTaskUnit) handleError(result *taskframework.TaskUnitRunResult) {
@@ -251,6 +275,8 @@ func (dtu *DownloadTaskUnit) handleError(result *taskframework.TaskUnitRunResult
 		case 31045: // user not exists
 			fallthrough
 		case 31066: // file does not exist
+			result.NeedRetry = false
+		case 31297: // file does not exist
 			result.NeedRetry = false
 		case 31626: // user is not authorized
 			//可能是User-Agent不对
@@ -272,6 +298,10 @@ func (dtu *DownloadTaskUnit) execPanDownload(dlink string, result *taskframework
 	dtu.verboseInfof("[%s] 获取到下载链接: %s\n", dtu.taskInfo.Id(), dlink)
 
 	client := dtu.panHTTPClient()
+	activePCS := pcsconfig.Config.ActiveUserBaiduPCS()
+	cookieJar := activePCS.GetClient().Jar
+	newCookieJar, _ := CloneJarWithDomain(cookieJar, dlink)
+	client.SetCookiejar(newCookieJar)
 	err := dtu.download(dlink, client)
 	if err != nil {
 		result.ResultMessage = StrDownloadFailed
@@ -292,8 +322,16 @@ func (dtu *DownloadTaskUnit) locateDownload(result *taskframework.TaskUnitRunRes
 	}
 
 	// 更新链接的协议
-	FixHTTPLinkURL(rawDlinks[0])
-	dlink := rawDlinks[0].String()
+	// 跳过nb.cache这种还没有证书的
+	if len(rawDlinks) < dtu.DlinkPrefer+1 {
+		dtu.DlinkPrefer = len(rawDlinks) - 1
+	}
+	raw_dlink := rawDlinks[dtu.DlinkPrefer]
+	if strings.HasPrefix(raw_dlink.Host, "nb.cache") && len(rawDlinks) > dtu.DlinkPrefer+1 {
+		raw_dlink = rawDlinks[dtu.DlinkPrefer+1]
+	}
+	FixHTTPLinkURL(raw_dlink)
+	dlink := raw_dlink.String()
 
 	dtu.execPanDownload(dlink, result, &ok)
 	return
@@ -328,20 +366,30 @@ func (dtu *DownloadTaskUnit) pcsOrStreamingDownload(mode DownloadMode, result *t
 	return true // 下载成功
 }
 
-//checkFileValid 检测文件有效性
+// checkFileValid 检测文件有效性
 func (dtu *DownloadTaskUnit) checkFileValid(result *taskframework.TaskUnitRunResult) (ok bool) {
+	fi, err := os.Stat(dtu.SavePath)
+	if err == nil {
+		if fi.Size() != dtu.FileInfo.Size {
+			result.ResultMessage = StrDownloadCheckLengthFailed
+			result.NeedNextdindex = true
+			result.NeedRetry = true
+			return
+		}
+	}
 	if dtu.Cfg.IsTest || dtu.NoCheck {
 		// 不检测文件有效性
-		return
+		fmt.Printf("[%s] 跳过文件有效性检验\n", dtu.taskInfo.Id())
+		return true
 	}
 
-	if dtu.fileInfo.Size >= 128*converter.MB {
+	if dtu.FileInfo.Size >= 128*converter.MB {
 		// 大文件, 输出一句提示消息
 		fmt.Printf("[%s] 开始检验文件有效性, 请稍候...\n", dtu.taskInfo.Id())
 	}
 
 	// 就在这里处理校验出错
-	err := CheckFileValid(dtu.SavePath, dtu.fileInfo)
+	err = CheckFileValid(dtu.SavePath, dtu.FileInfo)
 	if err != nil {
 		result.ResultMessage = StrDownloadChecksumFailed
 		result.Err = err
@@ -406,11 +454,11 @@ func (dtu *DownloadTaskUnit) Run() (result *taskframework.TaskUnitRunResult) {
 	result = &taskframework.TaskUnitRunResult{}
 	// 获取文件信息
 	var err error
-	if dtu.fileInfo == nil || dtu.taskInfo.Retry() > 0 {
+	if dtu.FileInfo == nil || dtu.taskInfo.Retry() > 0 {
 		// 没有获取文件信息
 		// 如果是动态添加的下载任务, 是会写入文件信息的
 		// 如果该任务重试过, 则应该再获取一次文件信息
-		dtu.fileInfo, err = dtu.PCS.FilesDirectoriesMeta(dtu.PcsPath)
+		dtu.FileInfo, err = dtu.PCS.FilesDirectoriesMeta(dtu.PcsPath)
 		if err != nil {
 			// 如果不是未登录或文件不存在, 则不重试
 			result.ResultMessage = "获取下载路径信息错误"
@@ -422,37 +470,45 @@ func (dtu *DownloadTaskUnit) Run() (result *taskframework.TaskUnitRunResult) {
 
 	// 输出文件信息
 	fmt.Print("\n")
-	fmt.Printf("[%s] ----\n%s\n", dtu.taskInfo.Id(), dtu.fileInfo.String())
+	fmt.Printf("[%s] ----\n%s\n", dtu.taskInfo.Id(), dtu.FileInfo.String())
 
 	// 如果是一个目录, 将子文件和子目录加入队列
-	if dtu.fileInfo.Isdir {
+	if dtu.FileInfo.Isdir {
 		if !dtu.Cfg.IsTest { // 测试下载, 不建立空目录
 			os.MkdirAll(dtu.SavePath, 0777) // 首先在本地创建目录, 保证空目录也能被保存
 		}
 
 		// 获取该目录下的文件列表
-		fileList, err := dtu.PCS.FilesDirectoriesList(dtu.PcsPath, baidupcs.DefaultOrderOptions)
-		if err != nil {
-			result.ResultMessage = "获取目录信息错误"
-			result.Err = err
-			result.NeedRetry = true
-			return
+		//fileList, err := dtu.PCS.FilesDirectoriesList(dtu.PcsPath, baidupcs.DefaultOrderOptions)
+		//if err != nil {
+		//	result.ResultMessage = "获取目录信息错误"
+		//	result.Err = err
+		//	result.NeedRetry = true
+		//	return
+		//}
+		//
+		//for k := range fileList {
+		//	// 添加子任务
+		//	subUnit := *dtu
+		//	newCfg := *dtu.Cfg
+		//	subUnit.Cfg = &newCfg
+		//	subUnit.FileInfo = fileList[k] // 保存文件信息
+		//	subUnit.PcsPath = fileList[k].Path
+		//	subUnit.SavePath = filepath.Join(dtu.SavePath, fileList[k].Filename) // 保存位置
+		//
+		//	// 加入父队列
+		//	info := dtu.ParentTaskExecutor.Append(&subUnit, dtu.taskInfo.MaxRetry())
+		//	fmt.Printf("[%s] 加入下载队列: %s\n", info.Id(), fileList[k].Path)
+		//}
+		//
+		result.Succeed = true // 执行成功
+		return
+	}
+
+	if dtu.FileInfo.Size == 0 {
+		if !dtu.Cfg.IsTest {
+			os.Create(dtu.SavePath)
 		}
-
-		for k := range fileList {
-			// 添加子任务
-			subUnit := *dtu
-			newCfg := *dtu.Cfg
-			subUnit.Cfg = &newCfg
-			subUnit.fileInfo = fileList[k] // 保存文件信息
-			subUnit.PcsPath = fileList[k].Path
-			subUnit.SavePath = filepath.Join(dtu.SavePath, fileList[k].Filename) // 保存位置
-
-			// 加入父队列
-			info := dtu.ParentTaskExecutor.Append(&subUnit, dtu.taskInfo.MaxRetry())
-			fmt.Printf("[%s] 加入下载队列: %s\n", info.Id(), fileList[k].Path)
-		}
-
 		result.Succeed = true // 执行成功
 		return
 	}
@@ -487,12 +543,18 @@ func (dtu *DownloadTaskUnit) Run() (result *taskframework.TaskUnitRunResult) {
 	// 检测文件有效性
 	ok = dtu.checkFileValid(result)
 	if !ok {
+		if result.NeedNextdindex == true {
+			dtu.DlinkPrefer += 1
+		}
 		// 校验不成功, 返回结果
 		return result
+	} else {
+		if dtu.ModifyMTime {
+			os.Chtimes(dtu.SavePath, time.Unix(dtu.FileInfo.Mtime, 0), time.Unix(dtu.FileInfo.Mtime, 0))
+		}
 	}
-
 	// 统计下载
-	dtu.DownloadStatistic.AddTotalSize(dtu.fileInfo.Size)
+	dtu.DownloadStatistic.AddTotalSize(dtu.FileInfo.Size)
 	// 下载成功
 	result.Succeed = true
 	return

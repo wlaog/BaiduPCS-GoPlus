@@ -2,9 +2,10 @@ package taskframework
 
 import (
 	"github.com/GeertJohan/go.incremental"
-	"github.com/felixonmars/BaiduPCS-Go/pcsutil/waitgroup"
 	"github.com/oleiade/lane"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil/waitgroup"
 	"strconv"
+	"sync/atomic"
 	"time"
 )
 
@@ -13,6 +14,7 @@ type (
 		incr     *incremental.Int // 任务id生成
 		deque    *lane.Deque      // 队列
 		parallel int              // 任务的最大并发量
+		stopped  int32            // 停止标志, 置位后不再派发新任务
 
 		// 是否统计失败队列
 		IsFailedDeque bool
@@ -79,6 +81,10 @@ func (te *TaskExecutor) Execute() {
 	for {
 		wg := waitgroup.NewWaitGroup(te.parallel)
 		for {
+			if te.Stopped() { // 已停止, 不再派发新任务
+				break
+			}
+
 			e := te.deque.Shift()
 			if e == nil { // 任务为空
 				break
@@ -107,6 +113,10 @@ func (te *TaskExecutor) Execute() {
 
 				// 需要进行重试
 				if result.NeedRetry {
+					if te.Stopped() { // 已停止, 失败任务不再重试
+						task.Unit.OnComplete(result)
+						return
+					}
 					// 重试次数超出限制
 					// 执行失败
 					if task.Info.IsExceedRetry() {
@@ -118,7 +128,6 @@ func (te *TaskExecutor) Execute() {
 						task.Unit.OnComplete(result)
 						return
 					}
-
 					task.Info.retry++         // 增加重试次数
 					task.Unit.OnRetry(result) // 调用重试
 					task.Unit.OnComplete(result)
@@ -130,7 +139,7 @@ func (te *TaskExecutor) Execute() {
 
 				// 执行失败
 				task.Unit.OnFailed(result)
-				if te.IsFailedDeque {
+				if te.IsFailedDeque && result.Extra != "skip" {
 					// 加入失败队列
 					te.failedDeque.Append(task)
 				}
@@ -139,6 +148,10 @@ func (te *TaskExecutor) Execute() {
 		}
 
 		wg.Wait()
+
+		if te.Stopped() { // 已停止, 不再继续执行
+			break
+		}
 
 		// 没有任务了
 		if te.deque.Size() == 0 {
@@ -152,9 +165,14 @@ func (te *TaskExecutor) FailedDeque() *lane.Deque {
 	return te.failedDeque
 }
 
-//Stop 停止执行
+//Stop 停止执行: 不再派发新任务, 已在执行的任务继续运行直至完成
 func (te *TaskExecutor) Stop() {
+	atomic.StoreInt32(&te.stopped, 1)
+}
 
+//Stopped 返回是否已请求停止
+func (te *TaskExecutor) Stopped() bool {
+	return atomic.LoadInt32(&te.stopped) == 1
 }
 
 //Pause 暂停执行

@@ -2,18 +2,20 @@ package pcscommand
 
 import (
 	"fmt"
-	"github.com/felixonmars/BaiduPCS-Go/baidupcs"
-	"github.com/felixonmars/BaiduPCS-Go/internal/pcsconfig"
-	"github.com/felixonmars/BaiduPCS-Go/internal/pcsfunctions/pcsupload"
-	"github.com/felixonmars/BaiduPCS-Go/pcstable"
-	"github.com/felixonmars/BaiduPCS-Go/pcsutil"
-	"github.com/felixonmars/BaiduPCS-Go/pcsutil/checksum"
-	"github.com/felixonmars/BaiduPCS-Go/pcsutil/converter"
-	"github.com/felixonmars/BaiduPCS-Go/pcsutil/taskframework"
+	"github.com/qjfoidnh/BaiduPCS-Go/baidupcs"
+	"github.com/qjfoidnh/BaiduPCS-Go/internal/pcsconfig"
+	"github.com/qjfoidnh/BaiduPCS-Go/internal/pcsfunctions/pcsupload"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcstable"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil/checksum"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil/converter"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil/taskframework"
 	"os"
+	"os/signal"
 	"path"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 const (
@@ -24,49 +26,32 @@ const (
 type (
 	// UploadOptions 上传可选项
 	UploadOptions struct {
-		Parallel      int
-		MaxRetry      int
-		NoRapidUpload bool
-		NoSplitFile   bool // 禁用分片上传
+		Parallel        int
+		MaxRetry        int
+		Load            int
+		NoRapidUpload   bool
+		NoSplitFile     bool   // 禁用分片上传
+		Policy          string // 同名文件处理策略
+		NoFilenameCheck bool   // 禁用文件名合法性检查
 	}
 )
 
-// RunRapidUpload 执行秒传文件, 前提是知道文件的大小, md5, 前256KB切片的 md5, crc32
-func RunRapidUpload(targetPath, contentMD5, sliceMD5, crc32 string, length int64) {
-	err := matchPathByShellPatternOnce(&targetPath)
-	if err != nil {
-		fmt.Printf("警告: %s, 获取网盘路径 %s 错误, %s\n", baidupcs.OperationRapidUpload, targetPath, err)
+func uploadPrintFormat(load int) string {
+	if load <= 1 {
+		return pcsupload.DefaultPrintFormat
 	}
-
-	err = GetBaiduPCS().RapidUpload(targetPath, contentMD5, sliceMD5, crc32, length)
-	if err != nil {
-		fmt.Printf("%s失败, 消息: %s\n", baidupcs.OperationRapidUpload, err)
-		return
-	}
-
-	fmt.Printf("%s成功, 保存到网盘路径: %s\n", baidupcs.OperationRapidUpload, targetPath)
-	return
+	return "[%s] ↑ %s/%s %s/s in %s ...\n"
 }
 
-// RunCreateSuperFile 执行分片上传—合并分片文件
-func RunCreateSuperFile(targetPath string, blockList ...string) {
-	err := matchPathByShellPatternOnce(&targetPath)
-	if err != nil {
-		fmt.Printf("警告: %s, 获取网盘路径 %s 错误, %s\n", baidupcs.OperationUploadCreateSuperFile, targetPath, err)
+func uploadFailureError(failed int) error {
+	if failed == 0 {
+		return nil
 	}
-
-	err = GetBaiduPCS().UploadCreateSuperFile(true, targetPath, blockList...)
-	if err != nil {
-		fmt.Printf("%s失败, 消息: %s\n", baidupcs.OperationUploadCreateSuperFile, err)
-		return
-	}
-
-	fmt.Printf("%s成功, 保存到网盘路径: %s\n", baidupcs.OperationUploadCreateSuperFile, targetPath)
-	return
+	return fmt.Errorf("上传失败文件数: %d", failed)
 }
 
 // RunUpload 执行文件上传
-func RunUpload(localPaths []string, savePath string, opt *UploadOptions) {
+func RunUpload(localPaths []string, savePath string, opt *UploadOptions) error {
 	if opt == nil {
 		opt = &UploadOptions{}
 	}
@@ -76,26 +61,34 @@ func RunUpload(localPaths []string, savePath string, opt *UploadOptions) {
 		opt.Parallel = pcsconfig.Config.MaxUploadParallel
 	}
 
+	opt.NoFilenameCheck = pcsconfig.Config.IgnoreIllegal
+
 	if opt.MaxRetry < 0 {
 		opt.MaxRetry = DefaultUploadMaxRetry
 	}
 
+	if opt.Load <= 0 {
+		opt.Load = pcsconfig.Config.MaxUploadLoad
+	}
+
+	if opt.Policy != baidupcs.SkipPolicy && opt.Policy != baidupcs.OverWritePolicy && opt.Policy != baidupcs.RsyncPolicy {
+		opt.Policy = pcsconfig.Config.UPolicy
+	}
+
 	err := matchPathByShellPatternOnce(&savePath)
 	if err != nil {
-		fmt.Printf("警告: 上传文件, 获取网盘路径 %s 错误, %s\n", savePath, err)
+		return fmt.Errorf("上传文件, 获取网盘路径 %s 错误: %w", savePath, err)
 	}
 
 	switch len(localPaths) {
 	case 0:
-		fmt.Printf("本地路径为空\n")
-		return
+		return fmt.Errorf("本地路径为空")
 	}
 
 	// 打开上传状态
 	uploadDatabase, err := pcsupload.NewUploadingDatabase()
 	if err != nil {
-		fmt.Printf("打开上传未完成数据库错误: %s\n", err)
-		return
+		return fmt.Errorf("打开上传未完成数据库错误: %w", err)
 	}
 	defer uploadDatabase.Close()
 
@@ -110,13 +103,30 @@ func RunUpload(localPaths []string, savePath string, opt *UploadOptions) {
 		statistic = &pcsupload.UploadStatistic{}
 	)
 
+	// 优雅退出: 第一次 Ctrl+C 停止派发新任务并等待进行中的分片完成后保存进度, 第二次 Ctrl+C 强制退出
+	sigChan := make(chan os.Signal, 2)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		fmt.Println("\n收到退出信号, 等待进行中的分片完成 (再次 Ctrl+C 强制退出)...")
+		executor.Stop()
+		pcsupload.GracefulStopActiveUploaders()
+		<-sigChan
+		fmt.Println("强制退出")
+		os.Exit(130)
+	}()
+
+	fmt.Print("\n")
+	fmt.Printf("[0] 提示: 当前上传单个文件最大并发量为: %d, 最大同时上传文件数为: %d\n", opt.Parallel, opt.Load)
+
 	statistic.StartTimer() // 开始计时
+
+	LoadCount := 0
 
 	for k := range localPaths {
 		walkedFiles, err := pcsutil.WalkDir(localPaths[k], "")
 		if err != nil {
-			fmt.Printf("警告: 遍历错误: %s\n", err)
-			continue
+			return fmt.Errorf("遍历本地路径 %s 错误: %w", localPaths[k], err)
 		}
 
 		for k3 := range walkedFiles {
@@ -133,29 +143,40 @@ func RunUpload(localPaths []string, savePath string, opt *UploadOptions) {
 			if localPathDir == "." {
 				localPathDir = ""
 			}
-
+			if len(localPaths) == 1 && len(walkedFiles) == 1 {
+				opt.Load = 1
+			}
 			subSavePath = strings.TrimPrefix(walkedFiles[k3], localPathDir)
-
+			if !opt.NoFilenameCheck && !pcsutil.ChPathLegal(walkedFiles[k3]) {
+				return fmt.Errorf("%s 文件路径含有非法字符", walkedFiles[k3])
+			}
+			LoadCount++
 			info := executor.Append(&pcsupload.UploadTaskUnit{
 				LocalFileChecksum: checksum.NewLocalFileChecksum(walkedFiles[k3], int(baidupcs.SliceMD5Size)),
 				SavePath:          path.Clean(savePath + baidupcs.PathSeparator + subSavePath),
-				PCS:               pcs,
+				PCS:               pcs.CopyPCS(),
 				UploadingDatabase: uploadDatabase,
 				Parallel:          opt.Parallel,
+				PrintFormat:       uploadPrintFormat(opt.Load),
 				NoRapidUpload:     opt.NoRapidUpload,
 				NoSplitFile:       opt.NoSplitFile,
 				UploadStatistic:   statistic,
+				Policy:            opt.Policy,
 			}, opt.MaxRetry)
+			if LoadCount >= opt.Load {
+				LoadCount = opt.Load
+			}
 			fmt.Printf("[%s] 加入上传队列: %s\n", info.Id(), walkedFiles[k3])
 		}
 	}
 
 	// 没有添加任何任务
 	if executor.Count() == 0 {
-		fmt.Printf("未检测到上传的文件.\n")
-		return
+		return fmt.Errorf("未检测到上传的文件")
 	}
 
+	// 设置上传文件并发数
+	executor.SetParallel(LoadCount)
 	// 执行上传任务
 	executor.Execute()
 
@@ -164,7 +185,8 @@ func RunUpload(localPaths []string, savePath string, opt *UploadOptions) {
 
 	// 输出上传失败的文件列表
 	failedList := executor.FailedDeque()
-	if failedList.Size() != 0 {
+	failedCount := failedList.Size()
+	if failedCount != 0 {
 		fmt.Printf("以下文件上传失败: \n")
 		tb := pcstable.NewTable(os.Stdout)
 		for e := failedList.Shift(); e != nil; e = failedList.Shift() {
@@ -173,4 +195,5 @@ func RunUpload(localPaths []string, savePath string, opt *UploadOptions) {
 		}
 		tb.Render()
 	}
+	return uploadFailureError(failedCount)
 }

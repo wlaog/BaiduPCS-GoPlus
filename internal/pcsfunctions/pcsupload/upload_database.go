@@ -2,14 +2,15 @@ package pcsupload
 
 import (
 	"errors"
-	"github.com/felixonmars/BaiduPCS-Go/internal/pcsconfig"
-	"github.com/felixonmars/BaiduPCS-Go/pcsutil/checksum"
-	"github.com/felixonmars/BaiduPCS-Go/pcsutil/converter"
-	"github.com/felixonmars/BaiduPCS-Go/pcsutil/jsonhelper"
-	"github.com/felixonmars/BaiduPCS-Go/requester/uploader"
+	"github.com/qjfoidnh/BaiduPCS-Go/internal/pcsconfig"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil/checksum"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil/converter"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil/jsonhelper"
+	"github.com/qjfoidnh/BaiduPCS-Go/requester/uploader"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -22,6 +23,7 @@ type (
 
 	// UploadingDatabase 未完成上传的数据库
 	UploadingDatabase struct {
+		lock          sync.RWMutex
 		UploadingList []*Uploading `json:"upload_state"`
 		Timestamp     int64        `json:"timestamp"`
 
@@ -31,7 +33,16 @@ type (
 
 // NewUploadingDatabase 初始化未完成上传的数据库, 从库中读取内容
 func NewUploadingDatabase() (ud *UploadingDatabase, err error) {
-	file, err := os.OpenFile(filepath.Join(pcsconfig.GetConfigDir(), UploadingFileName), os.O_CREATE|os.O_RDWR, 0777)
+	return NewUploadingDatabaseAt(filepath.Join(pcsconfig.GetConfigDir(), UploadingFileName))
+}
+
+// NewUploadingDatabaseAt 与 NewUploadingDatabase 相同, 但把状态文件放在指定路径。
+//
+// 新增此入口是为了让调用方能在配置目录之外使用上传单元 (例如使用一个私有的、
+// 空的临时状态文件), 从而避免读到上一次中断留下的陈旧断点记录。既有调用方的
+// 行为完全不变, 因为 NewUploadingDatabase 只是转调到这里并沿用原路径。
+func NewUploadingDatabaseAt(path string) (ud *UploadingDatabase, err error) {
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0777)
 	if err != nil {
 		return nil, err
 	}
@@ -50,7 +61,10 @@ func NewUploadingDatabase() (ud *UploadingDatabase, err error) {
 
 	err = jsonhelper.UnmarshalData(file, ud)
 	if err != nil {
-		return nil, err
+		_, err = file.Write([]byte(""))
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return ud, nil
@@ -61,6 +75,9 @@ func (ud *UploadingDatabase) Save() error {
 	if ud.dataFile == nil {
 		return errors.New("dataFile is nil")
 	}
+
+	ud.lock.Lock()
+	defer ud.lock.Unlock()
 
 	ud.Timestamp = time.Now().Unix()
 
@@ -88,10 +105,11 @@ func (ud *UploadingDatabase) Save() error {
 
 // UpdateUploading 更新正在上传
 func (ud *UploadingDatabase) UpdateUploading(meta *checksum.LocalFileMeta, state *uploader.InstanceState) {
+	ud.lock.Lock()
+	defer ud.lock.Unlock()
 	if meta == nil {
 		return
 	}
-
 	meta.CompleteAbsPath()
 	for k, uploading := range ud.UploadingList {
 		if uploading.LocalFileMeta == nil {
@@ -109,16 +127,41 @@ func (ud *UploadingDatabase) UpdateUploading(meta *checksum.LocalFileMeta, state
 	})
 }
 
+// UpdateFullBlock 一次性更新全部block的md5值
+func (ud *UploadingDatabase) UpdateFullBlock(meta *checksum.LocalFileMeta, state *uploader.InstanceState) {
+	ud.lock.Lock()
+	defer ud.lock.Unlock()
+	if meta == nil {
+		return
+	}
+	meta.CompleteAbsPath()
+	for k, uploading := range ud.UploadingList {
+		if uploading.LocalFileMeta == nil {
+			continue
+		}
+		if uploading.LocalFileMeta.EqualLengthMD5(meta) || uploading.LocalFileMeta.Path == meta.Path {
+			if len(meta.BlocksList) > 0 {
+				for index, md5 := range meta.BlocksList {
+					state.BlockList[index].CheckSum = md5
+				}
+			}
+			ud.UploadingList[k].State = state
+			return
+		}
+	}
+}
+
 func (ud *UploadingDatabase) deleteIndex(k int) {
 	ud.UploadingList = append(ud.UploadingList[:k], ud.UploadingList[k+1:]...)
 }
 
 // Delete 删除
 func (ud *UploadingDatabase) Delete(meta *checksum.LocalFileMeta) bool {
+	ud.lock.Lock()
+	defer ud.lock.Unlock()
 	if meta == nil {
 		return false
 	}
-
 	meta.CompleteAbsPath()
 	for k, uploading := range ud.UploadingList {
 		if uploading.LocalFileMeta == nil {
@@ -144,7 +187,10 @@ func (ud *UploadingDatabase) Search(meta *checksum.LocalFileMeta) *uploader.Inst
 		if uploading.LocalFileMeta == nil {
 			continue
 		}
-		if uploading.LocalFileMeta.EqualLengthMD5(meta) {
+		if uploading.BlocksList == nil && (uploading.State == nil || uploading.State.Uploadid == "") {
+			continue
+		}
+		if uploading.LocalFileMeta.MD5 != nil && uploading.LocalFileMeta.EqualLengthMD5(meta) {
 			return uploading.State
 		}
 		if uploading.LocalFileMeta.Path == meta.Path {
@@ -155,9 +201,9 @@ func (ud *UploadingDatabase) Search(meta *checksum.LocalFileMeta) *uploader.Inst
 				return nil
 			}
 
-			// 覆盖数据
 			meta.MD5 = uploading.LocalFileMeta.MD5
 			meta.SliceMD5 = uploading.LocalFileMeta.SliceMD5
+			meta.BlocksList = uploading.LocalFileMeta.BlocksList
 			return uploading.State
 		}
 	}
@@ -165,6 +211,8 @@ func (ud *UploadingDatabase) Search(meta *checksum.LocalFileMeta) *uploader.Inst
 }
 
 func (ud *UploadingDatabase) clearModTimeChange() {
+	ud.lock.Lock()
+	defer ud.lock.Unlock()
 	for i := 0; i < len(ud.UploadingList); i++ {
 		uploading := ud.UploadingList[i]
 		if uploading.LocalFileMeta == nil {

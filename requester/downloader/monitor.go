@@ -3,8 +3,8 @@ package downloader
 import (
 	"context"
 	"errors"
-	"github.com/felixonmars/BaiduPCS-Go/pcsverbose"
-	"github.com/felixonmars/BaiduPCS-Go/requester/transfer"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsverbose"
+	"github.com/qjfoidnh/BaiduPCS-Go/requester/transfer"
 	"sort"
 	"time"
 )
@@ -169,7 +169,7 @@ func (mt *Monitor) registerAllCompleted() {
 					mt.err = worker.Err()
 					close(mt.completed)
 					return
-				case StatusCodeSuccessed, StatusCodeCanceled:
+				case StatusCodeSucceeded, StatusCodeCanceled:
 					completeNum++
 				}
 			}
@@ -261,7 +261,7 @@ func (mt *Monitor) TryAddNewWork() {
 	availableWorker.ClearStatus()
 
 	mt.resetController.AddResetNum()
-	pcsverbose.Verbosef("MONITER: worker[%d] add new range: %s\n", availableWorker.ID(), r.ShowDetails())
+	pcsverbose.Verbosef("MONITOR: worker[%d] add new range: %s\n", availableWorker.ID(), r.ShowDetails())
 	go availableWorker.Execute()
 }
 
@@ -356,7 +356,9 @@ func (mt *Monitor) Execute(cancelCtx context.Context) {
 
 	mt.registerAllCompleted() // 注册completed
 	ticker := time.NewTicker(990 * time.Millisecond)
+	ticker2 := time.NewTicker(99 * time.Millisecond)
 	defer ticker.Stop()
+	defer ticker2.Stop()
 
 	//开始监控
 	for {
@@ -385,8 +387,6 @@ func (mt *Monitor) Execute(cancelCtx context.Context) {
 				})
 			}
 
-			// 加入新range
-			mt.TryAddNewWork()
 
 			// 不重载worker
 			if !mt.isReloadWorker {
@@ -419,6 +419,9 @@ func (mt *Monitor) Execute(cancelCtx context.Context) {
 					mt.ResetWorker(worker)
 				}
 			} // end if 2
+		case <-ticker2.C:
+			// 加入新range
+			mt.TryAddNewWork()
 		} //end select
 	} //end for
 }

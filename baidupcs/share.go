@@ -2,8 +2,9 @@ package baidupcs
 
 import (
 	"errors"
-	"github.com/felixonmars/BaiduPCS-Go/baidupcs/pcserror"
 	"strings"
+
+	"github.com/qjfoidnh/BaiduPCS-Go/baidupcs/pcserror"
 )
 
 type (
@@ -11,11 +12,13 @@ type (
 	ShareOption struct {
 		Password string // 密码
 		Period   int    // 有效期
+		IsCombined bool // 是否将密码输出到分享链接
 	}
 
 	// Shared 分享信息
 	Shared struct {
 		Link    string `json:"link"`
+		Pwd     string `json:"pwd"`
 		ShareID int64  `json:"shareid"`
 	}
 
@@ -28,7 +31,11 @@ type (
 		Status          int     `json:"status"`          // 状态
 		Public          int     `json:"public"`          // 是否为公开分享
 		TypicalCategory int     `json:"typicalCategory"` // 文件类型
-		TypicalPath     string  `json:"typicalPath"`
+		TypicalPath     string  `json:"typicalPath"`     // 路径
+		ExpireType      int     `json:"expiredType"`     // 过期类型
+		ExpireTime      int64   `json:"expiredTime"`     // 过期时间
+		ViewCount       int     `json:"vCnt"`            // 浏览次数
+		Valid           string  // 是否过期
 	}
 
 	shareSURLInfo struct {
@@ -63,11 +70,11 @@ var (
 
 // ShareSet 分享文件
 func (pcs *BaiduPCS) ShareSet(paths []string, option *ShareOption) (s *Shared, pcsError pcserror.Error) {
-	if option == nil {
-		option = &ShareOption{}
+	if option.Password == "" || len(option.Password) != 4 {
+		option = &ShareOption{CreatePasswd(), option.Period, option.IsCombined}
 	}
 
-	dataReadCloser, pcsError := pcs.PrepareSharePSet(paths, option.Period)
+	dataReadCloser, pcsError := pcs.PrepareSharePSet(paths, option.Password, option.Period)
 	if pcsError != nil {
 		return
 	}
@@ -90,6 +97,7 @@ func (pcs *BaiduPCS) ShareSet(paths []string, option *ShareOption) (s *Shared, p
 		errInfo.Err = ErrShareLinkNotFound
 		return nil, errInfo
 	}
+	jsonData.Pwd = option.Password
 
 	return jsonData.Shared, nil
 }

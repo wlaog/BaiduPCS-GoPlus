@@ -4,14 +4,14 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"errors"
-	"github.com/felixonmars/BaiduPCS-Go/baidupcs/pcserror"
-	"github.com/felixonmars/BaiduPCS-Go/pcsutil/cachepool"
-	"github.com/felixonmars/BaiduPCS-Go/pcsutil/escaper"
-	"github.com/felixonmars/BaiduPCS-Go/requester/downloader"
+	"github.com/qjfoidnh/BaiduPCS-Go/baidupcs/pcserror"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil/cachepool"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil/converter"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil/escaper"
+	"github.com/qjfoidnh/BaiduPCS-Go/requester/downloader"
 	"io"
 	"mime"
 	"net/http"
-	"net/url"
 	"path"
 	"strconv"
 	"strings"
@@ -66,7 +66,7 @@ func (pcs *BaiduPCS) getLocateDownloadLink(pcspath string) (link string, pcsErro
 func (pcs *BaiduPCS) ExportByFileInfo(finfo *FileDirectory) (rinfo *RapidUploadInfo, pcsError pcserror.Error) {
 	errInfo := pcserror.NewPCSErrorInfo(OperationExportFileInfo)
 	errInfo.ErrType = pcserror.ErrTypeOthers
-	if finfo.Size > MaxRapidUploadSize {
+	if finfo.Size > MaxUploadSize {
 		errInfo.Err = ErrFileTooLarge
 		return nil, errInfo
 	}
@@ -103,9 +103,27 @@ func (pcs *BaiduPCS) GetRapidUploadInfoByFileInfo(finfo *FileDirectory) (rinfo *
 	// 只有ContentLength可以比较
 	// finfo记录的ContentMD5不一定是正确的
 	// finfo记录的Filename不一定与获取到的一致
-	return pcs.GetRapidUploadInfoByLink(link, &RapidUploadInfo{
+	rinfo, pcsError = pcs.GetRapidUploadInfoByLink(link, &RapidUploadInfo{
 		ContentLength: finfo.Size,
 	})
+
+	// 如果是没获取到MD5, 可尝试新接口(测试中), 新接口调用频率有限制且文件大小不能超过约3.9G
+	if pcsError != nil && pcsError.GetError() == ErrGetRapidUploadInfoMD5NotFound && finfo.Size < 4*converter.GB {
+		link, pcsError = pcs.GetDirectDownloadLink(finfo.Path)
+		rinfo, pcsError = pcs.GetRapidUploadInfoByLink(link, &RapidUploadInfo{
+			ContentLength: finfo.Size,
+		})
+	}
+	return rinfo, pcsError
+}
+
+// GetDirectDownloadLink 根据method=download方法获取下载链接, 能获取到新上传文件的信息, 作为常规秒传的备选方案
+func (pcs *BaiduPCS) GetDirectDownloadLink(path string) (link string, pcsError pcserror.Error) {
+	var header = pcs.getPanUAHeader()
+	header["Range"] = "bytes=0-" + strconv.FormatInt(SliceMD5Size-1, 10)
+	RawQuery := map[string]string{"path": path}
+	pcsURL := pcs.generatePCSURL("file", "download", RawQuery)
+	return pcsURL.String(), nil
 }
 
 // GetRapidUploadInfoByLink 通过下载链接, 获取文件秒传信息
@@ -153,11 +171,8 @@ func (pcs *BaiduPCS) GetRapidUploadInfoByLink(link string, compareRInfo *RapidUp
 		errInfo.Err = err
 		return nil, errInfo
 	}
-	filename, err := url.QueryUnescape(params["filename"])
-	if err != nil {
-		errInfo.Err = err
-		return nil, errInfo
-	}
+	filename := params["filename"]
+
 	if compareRInfo != nil && compareRInfo.Filename != "" && compareRInfo.Filename != filename {
 		errInfo.Err = ErrGetRapidUploadInfoFilenameNotEqual
 		return nil, errInfo
@@ -261,7 +276,7 @@ func (pcs *BaiduPCS) FixMD5ByFileInfo(finfo *FileDirectory) (pcsError pcserror.E
 		return errInfo
 	}
 
-	if finfo.Size > MaxRapidUploadSize { // 文件大于20GB
+	if finfo.Size > MaxUploadSize {
 		errInfo.Err = ErrFileTooLarge
 		return errInfo
 	}
@@ -341,7 +356,7 @@ func (pcs *BaiduPCS) recurseMatchPathByShellPattern(index int, patternSlice *[]s
 
 // MatchPathByShellPattern 通配符匹配文件路径, pattern 为绝对路径
 func (pcs *BaiduPCS) MatchPathByShellPattern(pattern string) (pcspaths []string, pcsError pcserror.Error) {
-	errInfo := pcserror.NewPCSErrorInfo(OperrationMatchPathByShellPattern)
+	errInfo := pcserror.NewPCSErrorInfo(OperationMatchPathByShellPattern)
 	errInfo.ErrType = pcserror.ErrTypeOthers
 
 	patternSlice := strings.Split(escaper.Escape(path.Clean(pattern), []rune{'['}), PathSeparator) // 转义中括号

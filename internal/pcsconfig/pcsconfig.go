@@ -2,12 +2,12 @@
 package pcsconfig
 
 import (
-	"github.com/felixonmars/BaiduPCS-Go/baidupcs"
-	"github.com/felixonmars/BaiduPCS-Go/pcsutil"
-	"github.com/felixonmars/BaiduPCS-Go/pcsutil/jsonhelper"
-	"github.com/felixonmars/BaiduPCS-Go/pcsverbose"
-	"github.com/felixonmars/BaiduPCS-Go/requester"
 	"github.com/json-iterator/go"
+	"github.com/qjfoidnh/BaiduPCS-Go/baidupcs"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil/jsonhelper"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsverbose"
+	"github.com/qjfoidnh/BaiduPCS-Go/requester"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -41,17 +41,25 @@ type PCSConfig struct {
 	MaxParallel       int `json:"max_parallel"`        // 最大下载并发量
 	MaxUploadParallel int `json:"max_upload_parallel"` // 最大上传并发量
 	MaxDownloadLoad   int `json:"max_download_load"`   // 同时进行下载文件的最大数量
+	MaxUploadLoad     int `json:"max_upload_load"`     // 同时进行上传文件的最大数量
 
 	MaxDownloadRate int64 `json:"max_download_rate"` // 限制最大下载速度
 	MaxUploadRate   int64 `json:"max_upload_rate"`   // 限制最大上传速度
 
-	UserAgent   string `json:"user_agent"`   // 浏览器标识
-	PCSUA       string `json:"pcs_ua"`       // PCS浏览器标识
-	PanUA       string `json:"pan_ua"`       // PAN浏览器标识
-	SaveDir     string `json:"savedir"`      // 下载储存路径
-	EnableHTTPS bool   `json:"enable_https"` // 启用https
-	Proxy       string `json:"proxy"`        // 代理
-	LocalAddrs  string `json:"local_addrs"`  // 本地网卡地址
+	UserAgent      string `json:"user_agent"`           // 浏览器标识
+	PCSUA          string `json:"pcs_ua"`               // PCS浏览器标识
+	PCSAddr        string `json:"pcs_addr"`             // PCS服务器域名
+	PanUA          string `json:"pan_ua"`               // PAN浏览器标识
+	SaveDir        string `json:"savedir"`              // 下载储存路径
+	EnableHTTPS    bool   `json:"enable_https"`         // 启用https
+	FixPCSAddr     bool   `json:"fix_pcs_addr"`         //上传不使用动态PCS服务器域名
+	ForceLogin     string `json:"force_login_username"` // 强制登录
+	Proxy          string `json:"proxy"`                // 代理
+	ProxyHostnames string `json:"proxy_hostnames"`      // 走代理的域名范围
+	LocalAddrs     string `json:"local_addrs"`          // 本地网卡地址
+	NoCheck        bool   `json:"no_check"`             // 禁用下载md5校验
+	IgnoreIllegal  bool   `json:"ignore_illegal"`       // 禁用上传文件名非法字符检查
+	UPolicy        string `json:"u_policy"`             // 上传重名文件处理策略
 
 	configFilePath string
 	configFile     *os.File
@@ -131,7 +139,7 @@ func (c *PCSConfig) init() error {
 		return ErrConfigFileNotExist
 	}
 
-	c.initDefaultConfig()
+	c.InitDefaultConfig()
 	err := c.loadConfigFromFile()
 	if err != nil {
 		return err
@@ -150,11 +158,14 @@ func (c *PCSConfig) init() error {
 		return err
 	}
 	c.pcs = c.activeUser.BaiduPCS()
+	c.pcs.SetPCSAddr(c.PCSAddr)
 
 	// 设置全局User-Agent
 	requester.UserAgent = c.UserAgent
 	// 设置全局代理
 	requester.SetGlobalProxy(c.Proxy)
+	// 设置代理规则
+	requester.SetProxyHostnameRules(c.ProxyHostnames)
 	// 设置本地网卡地址
 	requester.SetLocalTCPAddrList(strings.Split(c.LocalAddrs, ",")...)
 
@@ -217,15 +228,24 @@ func (c *PCSConfig) loadConfigFromFile() (err error) {
 	return nil
 }
 
-func (c *PCSConfig) initDefaultConfig() {
+func (c *PCSConfig) InitDefaultConfig() {
 	c.AppID = 266719
 	c.CacheSize = 65536
 	c.MaxParallel = 1
-	c.MaxUploadParallel = 8
+	c.MaxUploadParallel = 4
+	c.MaxUploadLoad = 4
 	c.MaxDownloadLoad = 1
 	c.UserAgent = requester.UserAgent
 	c.PCSUA = ""
+	c.PCSAddr = "pcs.baidu.com"
 	c.PanUA = baidupcs.NetdiskUA
+	c.EnableHTTPS = true
+	c.NoCheck = true
+	c.UPolicy = baidupcs.SkipPolicy
+	c.Proxy = ""
+	c.LocalAddrs = ""
+	c.IgnoreIllegal = true
+	c.ForceLogin = ""
 	c.EnableHTTPS = true
 
 	// 设置默认的下载路径
@@ -304,5 +324,11 @@ func (c *PCSConfig) fix() {
 	}
 	if c.MaxDownloadLoad < 1 {
 		c.MaxDownloadLoad = 1
+	}
+	if c.MaxUploadLoad < 1 {
+		c.MaxUploadLoad = 1
+	}
+	if c.UPolicy != baidupcs.SkipPolicy && c.UPolicy != baidupcs.OverWritePolicy && c.UPolicy != baidupcs.RsyncPolicy {
+		c.UPolicy = baidupcs.SkipPolicy
 	}
 }

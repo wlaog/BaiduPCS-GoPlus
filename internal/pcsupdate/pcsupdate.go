@@ -5,17 +5,18 @@ import (
 	"archive/zip"
 	"bytes"
 	"fmt"
-	"github.com/felixonmars/BaiduPCS-Go/internal/pcsconfig"
-	"github.com/felixonmars/BaiduPCS-Go/pcsliner"
-	"github.com/felixonmars/BaiduPCS-Go/pcsutil"
-	"github.com/felixonmars/BaiduPCS-Go/pcsutil/cachepool"
-	"github.com/felixonmars/BaiduPCS-Go/pcsutil/checkaccess"
-	"github.com/felixonmars/BaiduPCS-Go/pcsutil/converter"
-	"github.com/felixonmars/BaiduPCS-Go/pcsutil/jsonhelper"
-	"github.com/felixonmars/BaiduPCS-Go/requester/downloader"
-	"github.com/felixonmars/BaiduPCS-Go/requester/rio"
-	"github.com/felixonmars/BaiduPCS-Go/requester/transfer"
+	"github.com/qjfoidnh/BaiduPCS-Go/internal/pcsconfig"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsliner"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil/cachepool"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil/checkaccess"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil/converter"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil/jsonhelper"
+	"github.com/qjfoidnh/BaiduPCS-Go/requester/downloader"
+	"github.com/qjfoidnh/BaiduPCS-Go/requester/rio"
+	"github.com/qjfoidnh/BaiduPCS-Go/requester/transfer"
 	"net/http"
+	"os"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -42,7 +43,7 @@ func CheckUpdate(version string, yes bool) {
 	}
 	fmt.Println("检测更新中, 稍候...")
 	c := pcsconfig.Config.HTTPClient()
-	resp, err := c.Req(http.MethodGet, "https://api.github.com/repos/iikira/BaiduPCS-Go/releases/latest", nil, nil)
+	resp, err := c.Req(http.MethodGet, "https://api.github.com/repos/wlaog/BaiduPCS-GoPlus/releases/latest", nil, nil)
 	if resp != nil {
 		defer resp.Body.Close()
 	}
@@ -83,31 +84,29 @@ func CheckUpdate(version string, yes bool) {
 	}
 
 	builder := &strings.Builder{}
-	builder.WriteString("BaiduPCS-Go-" + releaseInfo.TagName + "-" + runtime.GOOS + "-.*?")
-	if runtime.GOOS == "darwin" && (runtime.GOARCH == "arm" || runtime.GOARCH == "arm64") {
-		builder.WriteString("arm")
-	} else {
-		switch runtime.GOARCH {
-		case "amd64":
-			builder.WriteString("(amd64|x86_64|x64)")
-		case "386":
-			builder.WriteString("(386|x86)")
-		case "arm":
-			builder.WriteString("(armv5|armv7|arm)")
-		case "arm64":
-			builder.WriteString("arm64")
-		case "mips":
-			builder.WriteString("mips")
-		case "mips64":
-			builder.WriteString("mips64")
-		case "mipsle":
-			builder.WriteString("(mipsle|mipsel)")
-		case "mips64le":
-			builder.WriteString("(mips64le|mips64el)")
-		default:
-			builder.WriteString(runtime.GOARCH)
-		}
+	builder.WriteString("BaiduPCS-GoPlus-" + regexp.QuoteMeta(releaseInfo.TagName) + "-" + runtime.GOOS + "-.*?")
+
+	switch runtime.GOARCH {
+	case "amd64":
+		builder.WriteString("(amd64|x86_64|x64)")
+	case "386":
+		builder.WriteString("(386|x86)")
+	case "arm":
+		builder.WriteString("(armv5|armv7|arm)")
+	case "arm64":
+		builder.WriteString("arm64")
+	case "mips":
+		builder.WriteString("mips")
+	case "mips64":
+		builder.WriteString("mips64")
+	case "mipsle":
+		builder.WriteString("(mipsle|mipsel)")
+	case "mips64le":
+		builder.WriteString("(mips64le|mips64el)")
+	default:
+		builder.WriteString(runtime.GOARCH)
 	}
+
 	builder.WriteString("\\.zip")
 
 	exp := regexp.MustCompile(builder.String())
@@ -234,12 +233,23 @@ func CheckUpdate(version string, yes bool) {
 
 		fileNum++
 
-		name := zipFile.Name[strings.Index(zipFile.Name, "/")+1:]
-		if name == "BaiduPCS-Go" {
+		name := filepath.FromSlash(zipFile.Name)
+		if filepath.IsAbs(name) || name == ".." || strings.HasPrefix(filepath.Clean(name), ".."+string(filepath.Separator)) {
+			rc.Close()
+			errTimes++
+			continue
+		}
+		if name == "BaiduPCS-GoPlus" || name == "BaiduPCS-GoPlus.exe" {
 			err = update(pcsutil.Executable(), rc)
 		} else {
+			if err = os.MkdirAll(filepath.Dir(filepath.Join(execPath, name)), 0755); err != nil {
+				rc.Close()
+				errTimes++
+				continue
+			}
 			err = update(filepath.Join(execPath, name), rc)
 		}
+		rc.Close()
 
 		if err != nil {
 			errTimes++

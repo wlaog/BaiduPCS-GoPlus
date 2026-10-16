@@ -3,14 +3,15 @@ package pcscommand
 import (
 	"container/list"
 	"fmt"
-	"github.com/felixonmars/BaiduPCS-Go/baidupcs"
-	"github.com/felixonmars/BaiduPCS-Go/baidupcs/pcserror"
-	"github.com/felixonmars/BaiduPCS-Go/pcsutil/converter"
-	"github.com/felixonmars/BaiduPCS-Go/pcsutil/pcstime"
 	"os"
 	"path"
 	"strings"
 	"time"
+
+	"github.com/qjfoidnh/BaiduPCS-Go/baidupcs"
+	"github.com/qjfoidnh/BaiduPCS-Go/baidupcs/pcserror"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil/converter"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil/pcstime"
 )
 
 type (
@@ -24,10 +25,12 @@ type (
 
 	// ExportOptions 导出可选项
 	ExportOptions struct {
-		RootPath  string // 根路径
-		SavePath  string // 输出路径
-		MaxRetry  int
-		Recursive bool
+		RootPath   string // 根路径
+		SavePath   string // 输出路径
+		MaxRetry   int
+		Recursive  bool
+		LinkFormat bool
+		StdOut     bool
 	}
 )
 
@@ -87,14 +90,17 @@ func RunExport(pcspaths []string, opt *ExportOptions) {
 		fmt.Println(err)
 		return
 	}
-
 	saveFile, err := os.OpenFile(opt.SavePath, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
 	if err != nil { // 不可写
-		fmt.Printf("%s\n", err)
-		return
+		if !opt.StdOut {
+			fmt.Printf("%s\n", err)
+			return
+		}
 	}
 	defer saveFile.Close()
-	fmt.Printf("导出的信息将保存在: %s\n", opt.SavePath)
+	if !opt.StdOut {
+		fmt.Printf("导出的信息将保存在: %s\n", opt.SavePath)
+	}
 
 	var (
 		au         = GetActiveUser()
@@ -157,7 +163,7 @@ func RunExport(pcspaths []string, opt *ExportOptions) {
 				continue
 			}
 
-			if len(fds) == 0 {
+			if len(fds) == 0 && !opt.StdOut {
 				_, writeErr = saveFile.Write(converter.ToBytes(fmt.Sprintf("BaiduPCS-Go mkdir \"%s\"\n", changeRootPath(task.rootPath, task.path, opt.RootPath))))
 				if writeErr != nil {
 					fmt.Printf("写入文件失败: %s\n", writeErr)
@@ -190,14 +196,25 @@ func RunExport(pcspaths []string, opt *ExportOptions) {
 			task.handleExportTaskError(l, failedList)
 			continue
 		}
-
-		_, writeErr = saveFile.Write(converter.ToBytes(fmt.Sprintf("BaiduPCS-Go rapidupload -length=%d -md5=%s -slicemd5=%s -crc32=%s \"%s\"\n", rinfo.ContentLength, rinfo.ContentMD5, rinfo.SliceMD5, rinfo.ContentCrc32, changeRootPath(task.rootPath, task.path, opt.RootPath))))
-		if writeErr != nil {
-			fmt.Printf("写入文件失败: %s\n", writeErr)
-			return // 直接返回
+		var outTemplate = fmt.Sprintf("BaiduPCS-Go rapidupload -length=%d -md5=%s -slicemd5=%s -crc32=%s \"%s\"\n", rinfo.ContentLength, rinfo.ContentMD5, rinfo.SliceMD5, rinfo.ContentCrc32, changeRootPath(task.rootPath, task.path, opt.RootPath))
+		if opt.LinkFormat {
+			outTemplate = fmt.Sprintf("%s#%s#%d#%s\n", rinfo.ContentMD5, rinfo.SliceMD5, rinfo.ContentLength, path.Base(task.path))
 		}
+		if opt.StdOut {
+			fmt.Print(outTemplate)
+		} else {
+			_, writeErr = saveFile.Write(converter.ToBytes(outTemplate))
+			if writeErr != nil {
+				fmt.Printf("写入文件失败: %s\n", writeErr)
+				return // 直接返回
+			}
 
-		fmt.Printf("[%d] - [%s] 导出成功\n", task.ID, task.path)
+			fmt.Printf("[%d] - [%s] 导出成功\n", task.ID, task.path)
+		}
+	}
+	if opt.StdOut {
+		os.Remove(opt.SavePath)
+		fmt.Println("导出完毕")
 	}
 
 	if failedList.Len() > 0 {

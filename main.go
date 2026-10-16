@@ -3,25 +3,6 @@ package main
 import (
 	"encoding/hex"
 	"fmt"
-	"github.com/felixonmars/BaiduPCS-Go/baidupcs"
-	"github.com/felixonmars/BaiduPCS-Go/internal/pcscommand"
-	"github.com/felixonmars/BaiduPCS-Go/internal/pcsconfig"
-	"github.com/felixonmars/BaiduPCS-Go/internal/pcsfunctions/pcsdownload"
-	_ "github.com/felixonmars/BaiduPCS-Go/internal/pcsinit"
-	"github.com/felixonmars/BaiduPCS-Go/internal/pcsupdate"
-	"github.com/felixonmars/BaiduPCS-Go/pcsliner"
-	"github.com/felixonmars/BaiduPCS-Go/pcsliner/args"
-	"github.com/felixonmars/BaiduPCS-Go/pcstable"
-	"github.com/felixonmars/BaiduPCS-Go/pcsutil"
-	"github.com/felixonmars/BaiduPCS-Go/pcsutil/checksum"
-	"github.com/felixonmars/BaiduPCS-Go/pcsutil/converter"
-	"github.com/felixonmars/BaiduPCS-Go/pcsutil/escaper"
-	"github.com/felixonmars/BaiduPCS-Go/pcsutil/getip"
-	"github.com/felixonmars/BaiduPCS-Go/pcsutil/pcstime"
-	"github.com/felixonmars/BaiduPCS-Go/pcsverbose"
-	"github.com/olekukonko/tablewriter"
-	"github.com/peterh/liner"
-	"github.com/urfave/cli"
 	"os"
 	"os/exec"
 	"path"
@@ -31,6 +12,26 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+
+	"github.com/olekukonko/tablewriter"
+	"github.com/peterh/liner"
+	"github.com/qjfoidnh/BaiduPCS-Go/baidupcs"
+	"github.com/qjfoidnh/BaiduPCS-Go/internal/pcscommand"
+	"github.com/qjfoidnh/BaiduPCS-Go/internal/pcsconfig"
+	"github.com/qjfoidnh/BaiduPCS-Go/internal/pcsfunctions/pcsdownload"
+	_ "github.com/qjfoidnh/BaiduPCS-Go/internal/pcsinit"
+	"github.com/qjfoidnh/BaiduPCS-Go/internal/pcsupdate"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsliner"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsliner/args"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcstable"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil/checksum"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil/converter"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil/escaper"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil/getip"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil/pcstime"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsverbose"
+	"github.com/urfave/cli"
 )
 
 const (
@@ -54,7 +55,7 @@ const (
 
 var (
 	// Version 版本号
-	Version = "v3.6.2-devel"
+	Version = "v0.2.0"
 
 	historyFilePath = filepath.Join(pcsconfig.GetConfigDir(), "pcs_command_history.txt")
 	reloadFn        = func(c *cli.Context) error {
@@ -93,9 +94,9 @@ func main() {
 	defer pcsconfig.Config.Close()
 
 	app := cli.NewApp()
-	app.Name = "BaiduPCS-Go"
+	app.Name = "BaiduPCS-GoPlus"
 	app.Version = Version
-	app.Author = "iikira/BaiduPCS-Go: https://github.com/felixonmars/BaiduPCS-Go"
+	app.Author = "wlaog; based on qjfoidnh/BaiduPCS-Go"
 	app.Copyright = "(c) 2016-2020 iikira."
 	app.Usage = "百度网盘客户端 for " + runtime.GOOS + "/" + runtime.GOARCH
 	app.Description = `BaiduPCS-Go 使用Go语言编写的百度网盘命令行客户端, 为操作百度网盘, 提供实用功能.
@@ -106,13 +107,12 @@ func main() {
 		下载网盘内文件, 支持网盘内目录 (文件夹) 下载, 支持多个文件或目录下载, 支持断点续传和高并发高速下载.
 
 	---------------------------------------------------
-	前往 https://github.com/felixonmars/BaiduPCS-Go 以获取更多帮助信息!
-	前往 https://github.com/felixonmars/BaiduPCS-Go/releases 以获取程序更新信息!
+	前往 https://github.com/wlaog/BaiduPCS-GoPlus 以获取帮助和上游文档!
+	前往 https://github.com/wlaog/BaiduPCS-GoPlus/releases 以获取程序更新!
 	---------------------------------------------------
 
 	交流反馈:
-		提交Issue: https://github.com/felixonmars/BaiduPCS-Go/issues
-		邮箱: i@mail.iikira.com`
+		提交Issue: https://github.com/wlaog/BaiduPCS-GoPlus/issues`
 
 	app.Flags = []cli.Flag{
 		cli.BoolFlag{
@@ -153,7 +153,7 @@ func main() {
 				lineArgs                   = args.Parse(line)
 				numArgs                    = len(lineArgs)
 				acceptCompleteFileCommands = []string{
-					"cd", "cp", "download", "export", "fixmd5", "locate", "ls", "meta", "mkdir", "mv", "rapidupload", "rm", "share", "tree", "upload",
+					"cd", "cp", "download", "export", "locate", "ls", "meta", "mkdir", "mv", "rm", "setastoken", "share", "transfer", "tree", "upload",
 				}
 				closed = strings.LastIndex(line, " ") == len(line)-1
 			)
@@ -402,26 +402,32 @@ func main() {
 	示例:
 		BaiduPCS-Go login
 		BaiduPCS-Go login -username=liuhua
-		BaiduPCS-Go login -bduss=123456789
+		BaiduPCS-Go login -bduss=123456789 -stoken=atahsrweoog
+		BaiduPCS-Go login -cookies="BDUSS=xxxxx; BAIDUID=yyyyyy; STOKEN=zzzzz; ...."
 
 	常规登录:
 		按提示一步一步来即可.
 
 	百度BDUSS获取方法:
-		参考这篇 Wiki: https://github.com/felixonmars/BaiduPCS-Go/wiki/关于-获取百度-BDUSS
-		或者百度搜索: 获取百度BDUSS`,
+		百度搜索: 获取百度BDUSS
+		
+	百度Cookies获取办法:
+	以Chrome为例，登录到自己的百度网盘主页，F12，然后切换到Network标签，刷新页面，Network标签下会刷出一大堆东西
+	找到第一条，点击，看到右侧出现的详情，往下翻到Cookies: xxxx; xxxxx; xxx...这样的字段，从冒号后（没有空格）一直复制到字段末尾`,
 			Category: "百度帐号",
 			Before:   reloadFn,
 			After:    saveFunc,
 			Action: func(c *cli.Context) error {
-				var bduss, ptoken, stoken string
-				if c.IsSet("bduss") {
+				var bduss, ptoken, stoken, cookies string
+				if c.IsSet("cookies") {
+					cookies = c.String("cookies")
+				} else if c.IsSet("bduss") {
 					bduss = c.String("bduss")
 					ptoken = c.String("ptoken")
 					stoken = c.String("stoken")
 				} else if c.NArg() == 0 {
 					var err error
-					bduss, ptoken, stoken, err = pcscommand.RunLogin(c.String("username"), c.String("password"))
+					bduss, ptoken, stoken, cookies, err = pcscommand.RunLogin(c.String("username"), c.String("password"))
 					if err != nil {
 						fmt.Println(err)
 						return err
@@ -431,7 +437,7 @@ func main() {
 					return nil
 				}
 
-				baidu, err := pcsconfig.Config.SetupUserByBDUSS(bduss, ptoken, stoken)
+				baidu, err := pcsconfig.Config.SetupUserByBDUSS(bduss, ptoken, stoken, cookies)
 				if err != nil {
 					fmt.Println(err)
 					return nil
@@ -459,7 +465,11 @@ func main() {
 				},
 				cli.StringFlag{
 					Name:  "stoken",
-					Usage: "百度 STOKEN, 配合 -bduss 参数使用 (可选)",
+					Usage: "百度 STOKEN, 配合 -bduss 参数使用 (可选, 欲使用转存功能则必选)",
+				},
+				cli.StringFlag{
+					Name:  "cookies",
+					Usage: "使用百度 Cookies 来登录百度账号",
 				},
 			},
 		},
@@ -588,6 +598,40 @@ func main() {
 			Before:      reloadFn,
 			Action: func(c *cli.Context) error {
 				fmt.Println(pcsconfig.Config.BaiduUserList.String())
+				return nil
+			},
+		},
+		{
+			Name:  "setastoken",
+			Usage: "设定当前账号的accessToken",
+			Description: `
+	设定当前登录帐号的accessToken:
+	若不使用秒传链接转存, 可不设定; accessToken申请及获取教程:
+	https://github.com/qjfoidnh/BaiduPCS-Go/wiki/accessToken%E8%8E%B7%E5%8F%96%E6%95%99%E7%A8%8B
+	注意accessToken的有效期为一个月, 过期后请按教程指导更新token
+
+	示例:
+	BaiduPCS-Go setastoken 156.182v9052tgf1006c89891bsfb2401974.YmKOAwBD9yGaG2s4p5NNkX4CXeIbJxx4hAxotfS.PyuHEs
+`,
+			Category: "百度帐号",
+			Before:   reloadFn,
+			After:    saveFunc,
+			Action: func(c *cli.Context) error {
+				activeUser := pcsconfig.Config.ActiveUser()
+				if activeUser.UID == 0 {
+					fmt.Println("请先登录")
+					return nil
+				}
+				if c.NArg() >= 2 {
+					cli.ShowCommandHelp(c, c.Command.Name)
+					return nil
+				} else if c.NArg() == 0 {
+					cli.ShowCommandHelp(c, c.Command.Name)
+					return nil
+				}
+				activeUser.AccessToken = c.Args().Get(0)
+				pcsconfig.Config.ActiveUserBaiduPCS().SetaccessToken(c.Args().Get(0))
+				fmt.Printf("当前用户名: %s 成功设置accessToken: %s\n", activeUser.Name, activeUser.AccessToken)
 				return nil
 			},
 		},
@@ -795,11 +839,40 @@ func main() {
 			Aliases:   []string{"t"},
 			Usage:     "列出目录的树形图",
 			UsageText: app.Name + " tree <目录>",
-			Category:  "百度网盘",
-			Before:    reloadFn,
+			Description: `
+	列出目录树形图。
+	默认从当前工作目录开始列出.
+
+	示例:
+
+	从根目录开始列出
+	BaiduPCS-Go tree /
+
+	只列出两层深度
+	BaiduPCS-Go tree --depth 2
+
+	同时显示文件名和fsid
+	BaiduPCS-Go tree --fsid
+`,
+			Category: "百度网盘",
+			Before:   reloadFn,
 			Action: func(c *cli.Context) error {
-				pcscommand.RunTree(c.Args().Get(0))
+				pcscommand.RunTree(c.Args().Get(0), 0, &pcscommand.TreeOptions{
+					Depth:    c.Int("depth"),
+					ShowFsid: c.Bool("fsid"),
+				})
 				return nil
+			},
+			Flags: []cli.Flag{
+				cli.IntFlag{
+					Name:  "depth",
+					Usage: "显示深度",
+					Value: -1,
+				},
+				cli.BoolFlag{
+					Name:  "fsid",
+					Usage: "带fsid显示",
+				},
 			},
 		},
 		{
@@ -957,7 +1030,7 @@ func main() {
 	自动跳过下载重名的文件!
 
 	下载模式说明:
-		pcs: 通过百度网盘的 PCS API 下载
+		pcs: 通过百度网盘的 PCS API 下载, locate模式提示user is not authorized可尝试此模式
 		stream: 通过百度网盘的 PCS API, 以流式文件的方式下载, 效果同 pcs
 		locate: 默认的下载模式。从百度网盘 Android 客户端, 获取下载链接的方式来下载
 
@@ -1025,6 +1098,9 @@ func main() {
 					Load:                 c.Int("l"),
 					MaxRetry:             c.Int("retry"),
 					NoCheck:              c.Bool("nocheck"),
+					LinkPrefer:           c.Int("dindex"),
+					ModifyMTime:          c.Bool("mtime"),
+					FullPath:             c.Bool("fullpath"),
 				}
 
 				pcscommand.RunDownload(c.Args(), do)
@@ -1078,6 +1154,18 @@ func main() {
 					Name:  "nocheck",
 					Usage: "下载文件完成后不校验文件",
 				},
+				cli.BoolFlag{
+					Name:  "mtime",
+					Usage: "将本地文件的修改时间设置为服务器上的修改时间",
+				},
+				cli.IntFlag{
+					Name:  "dindex",
+					Usage: "使用备选下载链接中的第几个，默认第一个",
+				},
+				cli.BoolFlag{
+					Name:  "fullpath",
+					Usage: "以网盘完整路径保存到本地",
+				},
 			},
 		},
 		{
@@ -1087,7 +1175,6 @@ func main() {
 			UsageText: app.Name + " upload <本地文件/目录的路径1> <文件/目录2> <文件/目录3> ... <目标目录>",
 			Description: `
 	上传默认采用分片上传的方式, 上传的文件将会保存到, <目标目录>.
-	遇到同名文件将会自动覆盖!!
 	当上传的文件名和网盘的目录名称相同时, 不会覆盖目录, 防止丢失数据.
 
 	注意: 
@@ -1123,12 +1210,16 @@ func main() {
 				}
 
 				subArgs := c.Args()
-				pcscommand.RunUpload(subArgs[:c.NArg()-1], subArgs[c.NArg()-1], &pcscommand.UploadOptions{
+				err := pcscommand.RunUpload(subArgs[:c.NArg()-1], subArgs[c.NArg()-1], &pcscommand.UploadOptions{
 					Parallel:      c.Int("p"),
 					MaxRetry:      c.Int("retry"),
+					Load:          c.Int("l"),
 					NoRapidUpload: c.Bool("norapid"),
-					NoSplitFile:   c.Bool("nosplit"),
+					Policy:        c.String("policy"),
 				})
+				if err != nil {
+					return cli.NewExitError(err.Error(), 1)
+				}
 				return nil
 			},
 			Flags: []cli.Flag{
@@ -1141,13 +1232,376 @@ func main() {
 					Usage: "上传失败最大重试次数",
 					Value: pcscommand.DefaultUploadMaxRetry,
 				},
-				cli.BoolFlag{
-					Name:  "norapid",
-					Usage: "不检测秒传",
+				cli.IntFlag{
+					Name:  "l",
+					Usage: "指定同时上传的最大文件数",
 				},
 				cli.BoolFlag{
-					Name:  "nosplit",
-					Usage: "禁用分片上传",
+					Name:  "norapid",
+					Usage: "跳过秒传",
+				},
+				cli.StringFlag{
+					Name:  "policy",
+					Usage: fmt.Sprintf("对同名文件的处理策略 (default: %s), %s, %s", baidupcs.SkipPolicy, baidupcs.OverWritePolicy, baidupcs.RsyncPolicy),
+				},
+			},
+		},
+		{
+			Name:    "reconcile",
+			Aliases: []string{"align"},
+			Usage:   "对齐本地: 手动把云端备份目录整理成与本地目录一致 (单向镜像)",
+			UsageText: app.Name + " reconcile probe --remote <云端目录> [--local <本地目录>]\n" +
+				"   " + app.Name + " reconcile --local <本地目录> --remote <云端目录> [--dry-run|--apply]",
+			Description: `
+	单向、手动触发的镜像整理: 以本地目录为唯一权威源, 让云端备份目录的
+	相对路径/文件名/内容与本地保持一致。默认只预览, 不改变云端。
+
+	自动备份仍由百度网盘官方客户端管理; 本功能不接管、不常驻。
+	执行 --apply 前请先暂停官方客户端的自动备份任务并退出客户端。
+
+	子命令:
+	  probe    只读可行性探测: 确认能否访问指定云端目录、枚举是否完整、
+	           服务端 MD5 能否用于比对。不修改任何云端或本地内容。
+	  plan     只读差异预览: 列出 UPLOAD/REPLACE/REMOVE/KEEP/CONFLICT。
+	           不修改任何云端或本地内容。
+	  apply    执行对齐 (会修改云端; 默认先预览并要求确认, 清理只移动不永久删除)
+
+	示例:
+	  # 1) 只读探测: 找出官方客户端备份目录, 并核对本地与云端
+	  BaiduPCS-Go reconcile probe --discover-roots
+	  BaiduPCS-Go reconcile probe --remote "/来自：本地电脑/WorkSync" --local "D:/WorkSync"
+
+	  # 2) 只读预览差异
+	  BaiduPCS-Go reconcile plan --local "D:/WorkSync" --remote "/来自：本地电脑/WorkSync"
+
+	  # 3) 确认后执行
+	  BaiduPCS-Go reconcile apply --local "D:/WorkSync" --remote "/来自：本地电脑/WorkSync"
+`,
+			Category: "百度网盘",
+			Before:   reloadFn,
+			Action: func(c *cli.Context) error {
+				cli.ShowCommandHelp(c, c.Command.Name)
+				return nil
+			},
+			Subcommands: []cli.Command{
+				{
+					Name:      "probe",
+					Usage:     "只读探测云端备份目录的可访问性与哈希能力 (不修改任何内容)",
+					UsageText: app.Name + " reconcile probe --remote <云端目录> [--local <本地目录>] [--discover-roots]",
+					Category:  "百度网盘",
+					Before:    reloadFn,
+					Action: func(c *cli.Context) error {
+						opt := &pcscommand.ReconcileProbeOptions{
+							RemoteRoot:    c.String("remote"),
+							LocalDir:      c.String("local"),
+							HashSamples:   c.Int("hash-samples"),
+							DiscoverRoots: c.Bool("discover-roots"),
+							Redact:        c.Bool("redact"),
+							JSONOut:       c.String("json-out"),
+							ShallowScan:   c.Bool("shallow"),
+						}
+						if opt.RemoteRoot == "" && opt.DiscoverRoots {
+							// Discovery alone still needs a root to inspect; use the
+							// cloud root, and only look one level down so listing the
+							// backup folders does not walk the whole account.
+							opt.RemoteRoot = "/"
+							opt.ShallowScan = true
+						}
+						if err := pcscommand.RunReconcileProbe(opt); err != nil {
+							return cli.NewExitError(err.Error(), 1)
+						}
+						return nil
+					},
+					Flags: []cli.Flag{
+						cli.StringFlag{
+							Name:  "remote",
+							Usage: "要探测的云端目录 (绝对路径)",
+						},
+						cli.StringFlag{
+							Name:  "local",
+							Usage: "可选的本地目录, 用于比对缺失项与内容哈希",
+						},
+						cli.BoolFlag{
+							Name:  "discover-roots",
+							Usage: "列出云端根目录下疑似官方客户端的备份目录",
+						},
+						cli.BoolFlag{
+							Name:  "redact",
+							Usage: "隐去报告中的账号标识, 便于把报告发给他人审阅",
+						},
+						cli.BoolFlag{
+							Name:  "shallow",
+							Usage: "只枚举目标目录的直接子项 (探测大目录时更快, 避免触发限流)",
+						},
+						cli.IntFlag{
+							Name:  "hash-samples",
+							Usage: "抽样比对内容哈希的文件数量",
+							Value: 10,
+						},
+						cli.StringFlag{
+							Name:  "json-out",
+							Usage: "JSON 报告的保存目录 (默认为配置目录下的 reconcile-reports)",
+						},
+					},
+				},
+				{
+					Name:      "plan",
+					Usage:     "预览差异计划 (只读, 不改变云端任何内容)",
+					UsageText: app.Name + " reconcile plan --local <本地目录> --remote <云端目录> [--hash]",
+					Description: `
+	只读预览: 扫描本地与云端目录, 列出四类差异, 不改变任何内容。
+
+	  UPLOAD   云端缺失, 需要上传
+	  REPLACE  同路径且内容不同, 需要覆盖
+	  REMOVE   云端多余 (本地已不存在), 待清理
+	  KEEP     经可靠规则确认一致
+	  CONFLICT 类型不符/名称不可映射/正在编辑/哈希不可判 — 需人工判断, 不会自动处理
+
+	判定规则要点:
+	  哈希相同可作为"内容一致"的证据; 哈希不同**不作为**"内容不同"的证据。
+	  服务端 MD5 只在单个 block_list 时可信, 大文件需用 --hash 重新计算比对,
+	  仍无法证明时默认保守地计划重新上传 (可用 --conservative 改为标记冲突)。
+
+	注意: --remote 会同时校验该目录必须存在且必须位于 --remote 之内;
+	本命令为只读, 可以安全地对真实备份目录反复执行。
+
+	示例:
+	  BaiduPCS-Go reconcile plan --local "D:/WorkSync" --remote "/来自：本地电脑/WorkSync"
+	  BaiduPCS-Go reconcile plan --local "D:/WorkSync" --remote "/来自：本地电脑/WorkSync" --hash
+	  BaiduPCS-Go reconcile plan --local "D:/WorkSync" --remote "/来自：本地电脑/WorkSync" --conservative
+`,
+					Category: "百度网盘",
+					Before:   reloadFn,
+					Action: func(c *cli.Context) error {
+						opt := &pcscommand.ReconcilePlanOptions{
+							LocalRoot:    c.String("local"),
+							RemoteRoot:   c.String("remote"),
+							HashFiles:    c.Bool("hash"),
+							Conservative: c.Bool("conservative"),
+							SkipSuffixes: c.String("skip-suffixes"),
+							SkipNames:    c.String("skip-names"),
+							JSONOut:      c.String("json-out"),
+							ShowAll:      c.Bool("all"),
+						}
+						if err := pcscommand.RunReconcilePlan(opt); err != nil {
+							return cli.NewExitError(err.Error(), 1)
+						}
+						return nil
+					},
+					Flags: []cli.Flag{
+						cli.StringFlag{
+							Name:  "local",
+							Usage: "本地目录 (权威源)",
+						},
+						cli.StringFlag{
+							Name:  "remote",
+							Usage: "要对齐的云端目录 (绝对路径)",
+						},
+						cli.BoolFlag{
+							Name:  "hash",
+							Usage: "计算内容哈希, 把'仅大小相同'升级为可信判等 (有本地读取开销)",
+						},
+						cli.BoolFlag{
+							Name:  "conservative",
+							Usage: "大小相同但哈希不可信时标记为冲突, 而不是计划重新上传",
+						},
+						cli.StringFlag{
+							Name:  "skip-suffixes",
+							Usage: "逗号分隔的排除后缀 (默认: 临时文件类)",
+						},
+						cli.StringFlag{
+							Name:  "skip-names",
+							Usage: "逗号分隔的排除文件名",
+						},
+						cli.StringFlag{
+							Name:  "json-out",
+							Usage: "JSON 报告的保存目录 (默认为配置目录下的 reconcile-reports)",
+						},
+						cli.BoolFlag{
+							Name:  "all",
+							Usage: "列出全部条目, 不截断每个分类",
+						},
+					},
+				},
+				{
+					Name:  "apply",
+					Usage: "执行对齐 (会修改云端; 默认先预览并要求确认)",
+					UsageText: app.Name + " reconcile apply --local <本地目录> --remote <云端目录> [--remove-mode quarantine|recycle]",
+					Description: `
+	执行对齐: 上传缺失文件、覆盖过期文件、把云端多余项移出镜像。
+
+	执行顺序 (安全设计):
+	  1. 创建缺失的云端目录
+	  2. 上传缺失文件 / 覆盖内容不同的文件
+	  3. 重新列举云端, 校验写入确实生效
+	  4. 只有前三步全部成功, 才处理云端多余项
+	任何一步失败都会跳过后续清理 —— 因为云端副本只有在本地对应版本
+	确认上传成功之后, 才算得上"多余"。
+
+	清理方式 (默认隔离区, 不做永久删除):
+	  quarantine  移动到镜像根目录之外的 /BackupReconcile_Quarantine/<时间戳>/
+	              保留原相对路径, 可随时移回; 执行记录里带完整清单
+	  recycle     移入网盘回收站 (保留约 35 天), 需要额外确认
+
+	安全闸门:
+	  * 扫描不完整 -> 直接拒绝执行, 不做任何改动
+	  * 有交互确认: 展示将清理的数量与容量, 输入 yes 才继续
+	  * 阈值保护: 清理超过 --max-remove-percent / --max-remove-bytes
+	    时需要额外确认
+	  * 本地文件在计划生成后发生变化 -> 跳过该文件, 不上传半写入内容
+	  * 移动失败绝不降级为永久删除, 只报告并停止
+
+	幂等: 中断后重新运行是安全的, 已完成的项会被识别为一致。
+
+	示例:
+	  BaiduPCS-Go reconcile apply --local "D:/test" --remote "/来自：本地电脑/test"
+	  BaiduPCS-Go reconcile apply --local "D:/test" --remote "/来自：本地电脑/test" --remove-mode recycle
+`,
+					Category: "百度网盘",
+					Before:   reloadFn,
+					Action: func(c *cli.Context) error {
+						opt := &pcscommand.ReconcileApplyOptions{
+							ReconcilePlanOptions: pcscommand.ReconcilePlanOptions{
+								LocalRoot:    c.String("local"),
+								RemoteRoot:   c.String("remote"),
+								HashFiles:    c.Bool("hash"),
+								Conservative: c.Bool("conservative"),
+								SkipSuffixes: c.String("skip-suffixes"),
+								SkipNames:    c.String("skip-names"),
+								JSONOut:      c.String("json-out"),
+							},
+							RemovalMode:      c.String("remove-mode"),
+							QuarantineRoot:   c.String("quarantine"),
+							ConfirmRemoval:   c.Bool("confirm-removal"),
+							AcknowledgeRecycle: c.Bool("yes-recycle"),
+							AcknowledgeBlast: c.Bool("yes-large-removal"),
+							MaxRemovePercent: c.Float64("max-remove-percent"),
+							MaxRemoveBytes:   c.Int64("max-remove-bytes"),
+						}
+						if err := pcscommand.RunReconcileApply(opt); err != nil {
+							return cli.NewExitError(err.Error(), 1)
+						}
+						return nil
+					},
+					Flags: []cli.Flag{
+						cli.StringFlag{
+							Name:  "local",
+							Usage: "本地目录 (权威源)",
+						},
+						cli.StringFlag{
+							Name:  "remote",
+							Usage: "要对其执行对齐的云端目录 (绝对路径)",
+						},
+						cli.StringFlag{
+							Name:  "remove-mode",
+							Usage: "云端多余项的处置方式: quarantine (隔离区, 默认) 或 recycle (回收站)",
+							Value: "quarantine",
+						},
+						cli.StringFlag{
+							Name:  "quarantine",
+							Usage: "隔离区顶层目录 (默认 /BackupReconcile_Quarantine)",
+						},
+						cli.BoolFlag{
+							Name:  "hash",
+							Usage: "计算内容哈希以精确判定一致性 (有本地读取开销)",
+						},
+						cli.BoolFlag{
+							Name:  "conservative",
+							Usage: "哈希不可用时标记为冲突而不是重新上传",
+						},
+						cli.BoolFlag{
+							Name:  "confirm-removal",
+							Usage: "跳过交互确认直接执行清理 (谨慎: 仅用于脚本化场景)",
+						},
+						cli.BoolFlag{
+							Name:  "yes-recycle",
+							Usage: "确认使用回收站方式清理 (隔离区可随时移回, 回收站依赖保留期)",
+						},
+						cli.BoolFlag{
+							Name:  "yes-large-removal",
+							Usage: "确认超过阈值的批量清理",
+						},
+						cli.Float64Flag{
+							Name:  "max-remove-percent",
+							Usage: "清理文件数占云端文件数的百分比阈值",
+							Value: 10,
+						},
+						cli.Int64Flag{
+							Name:  "max-remove-bytes",
+							Usage: "一次清理的总容量阈值 (字节)",
+							Value: 10 * 1024 * 1024 * 1024,
+						},
+						cli.StringFlag{
+							Name:  "skip-suffixes",
+							Usage: "逗号分隔的排除后缀",
+						},
+						cli.StringFlag{
+							Name:  "skip-names",
+							Usage: "逗号分隔的排除文件名",
+						},
+						cli.StringFlag{
+							Name:  "json-out",
+							Usage: "执行记录的保存目录",
+						},
+					},
+				},
+				{
+					Name:      "gui",
+					Usage:     "打开本地图形界面 (只监听本机)",
+					UsageText: app.Name + " reconcile gui [--local <本地目录>] [--remote <云端目录>] [--no-browser]",
+					Description: `
+	启动一个只在本机可用的图形界面, 用于完成"对齐本地"的三个步骤:
+
+	  1. 只读探测:  找出云端备份目录, 核对本地与云端
+	  2. 预览差异:  UPLOAD / REPLACE / MKDIR / REMOVE / KEEP / CONFLICT
+	  3. 执行对齐:  上传覆盖后清理云端多余项 (移入隔离区或回收站)
+
+	界面内已内置完整的操作步骤说明与安全设计说明。
+
+	安全性:
+	  * 只监听 127.0.0.1 (本机回环), 拒绝绑定其它地址
+	  * 每次启动生成随机令牌, 所有请求都必须携带
+	  * 图形界面只是 reconcile 命令的另一种入口, 比对与安全逻辑完全共用,
+	    因此界面不会绕过确认、阈值或"扫描不完整即拒绝执行"等保护
+	  * 不会修改本地文件, 不会替代或修改官方网盘客户端
+
+	按 Ctrl+C 或界面上的"关闭界面"结束。关闭界面不影响网盘内容。
+
+	示例:
+	  BaiduPCS-Go reconcile gui
+	  BaiduPCS-Go reconcile gui --local "D:/WorkSync" --remote "/来自：本地电脑/WorkSync"
+`,
+					Category: "百度网盘",
+					Before:   reloadFn,
+					Action: func(c *cli.Context) error {
+						if err := pcscommand.RunReconcileGui(&pcscommand.GuiOptions{
+							Addr:        c.String("addr"),
+							OpenBrowser: !c.Bool("no-browser"),
+							LocalDir:    c.String("local"),
+							RemoteRoot:  c.String("remote"),
+						}); err != nil {
+							return cli.NewExitError(err.Error(), 1)
+						}
+						return nil
+					},
+					Flags: []cli.Flag{
+						cli.StringFlag{
+							Name:  "local",
+							Usage: "预填本地目录",
+						},
+						cli.StringFlag{
+							Name:  "remote",
+							Usage: "预填云端目录",
+						},
+						cli.StringFlag{
+							Name:  "addr",
+							Usage: "监听地址 (仅允许本机地址, 默认自动选择端口)",
+						},
+						cli.BoolFlag{
+							Name:  "no-browser",
+							Usage: "不自动打开浏览器, 只打印地址",
+						},
+					},
 				},
 			},
 		},
@@ -1185,125 +1639,12 @@ func main() {
 			},
 		},
 		{
-			Name:      "rapidupload",
-			Aliases:   []string{"ru"},
-			Usage:     "手动秒传文件",
-			UsageText: app.Name + " rapidupload -length=<文件的大小> -md5=<文件的md5值> -slicemd5=<文件前256KB切片的md5值(可选)> -crc32=<文件的crc32值(可选)> <保存的网盘路径, 需包含文件名>",
-			Description: `
-	使用此功能秒传文件, 前提是知道文件的大小, md5, 前256KB切片的 md5 (可选), crc32 (可选), 且百度网盘中存在一模一样的文件.
-	上传的文件将会保存到网盘的目标目录.
-	遇到同名文件将会自动覆盖! 
-
-	可能无法秒传 20GB 以上的文件!!
-
-	示例:
-
-	1. 如果秒传成功, 则保存到网盘路径 /test
-	BaiduPCS-Go rapidupload -length=56276137 -md5=fbe082d80e90f90f0fb1f94adbbcfa7f -slicemd5=38c6a75b0ec4499271d4ea38a667ab61 -crc32=314332359 /test
-`,
-			Category: "百度网盘",
-			Before:   reloadFn,
-			Action: func(c *cli.Context) error {
-				if c.NArg() <= 0 || !c.IsSet("md5") || !c.IsSet("length") || !c.IsSet("slicemd5") {
-					cli.ShowCommandHelp(c, c.Command.Name)
-					return nil
-				}
-
-				pcscommand.RunRapidUpload(c.Args().Get(0), c.String("md5"), c.String("slicemd5"), c.String("crc32"), c.Int64("length"))
-				return nil
-			},
-			Flags: []cli.Flag{
-				cli.StringFlag{
-					Name:  "md5",
-					Usage: "文件的 md5 值",
-				},
-				cli.StringFlag{
-					Name:  "slicemd5",
-					Usage: "文件前 256KB 切片的 md5 值",
-				},
-				cli.StringFlag{
-					Name:  "crc32",
-					Usage: "文件的 crc32 值 (可选)",
-				},
-				cli.Int64Flag{
-					Name:  "length",
-					Usage: "文件的大小",
-				},
-			},
-		},
-		{
-			Name:      "createsuperfile",
-			Aliases:   []string{"csf"},
-			Usage:     "手动分片上传—合并分片文件",
-			UsageText: app.Name + " createsuperfile -path=<保存的网盘路径, 需包含文件名> block1 block2 ... ",
-			Description: `
-	block1, block2 ... 为文件分片的md5值
-	上传的文件将会保存到网盘的目标目录.
-	遇到同名文件将会自动覆盖! 
-
-	示例:
-
-	BaiduPCS-Go createsuperfile -path=1.mp4 ec87a838931d4d5d2e94a04644788a55 ec87a838931d4d5d2e94a04644788a55
-`,
-			Category: "百度网盘",
-			Before:   reloadFn,
-			Action: func(c *cli.Context) error {
-				if c.NArg() < 1 {
-					cli.ShowCommandHelp(c, c.Command.Name)
-					return nil
-				}
-
-				pcscommand.RunCreateSuperFile(c.String("path"), c.Args()...)
-				return nil
-			},
-			Flags: []cli.Flag{
-				cli.StringFlag{
-					Name:  "path",
-					Usage: "保存的网盘路径",
-					Value: "superfile",
-				},
-			},
-		},
-		{
-			Name:      "fixmd5",
-			Usage:     "修复文件MD5",
-			UsageText: app.Name + " fixmd5 <文件1> <文件2> <文件3> ...",
-			Description: `
-	尝试修复文件的MD5值, 以便于校验文件的完整性和导出文件.
-
-	使用分片上传文件, 当文件分片数大于1时, 百度网盘服务端最终计算所得的md5值和本地的不一致, 这可能是百度网盘的bug.
-	不过把上传的文件下载到本地后，对比md5值是匹配的, 也就是文件在传输中没有发生损坏.
-
-	对于MD5值可能有误的文件, 程序会在获取文件的元信息时, 给出MD5值 "可能不正确" 的提示, 表示此文件可以尝试进行MD5值修复.
-	修复文件MD5不一定能成功, 原因可能是服务器未刷新, 可过几天后再尝试.
-	修复文件MD5的原理为秒传文件, 即修复文件MD5成功后, 文件的创建日期, 修改日期, fs_id, 版本历史等信息将会被覆盖, 修复的MD5值将覆盖原先的MD5值, 但不影响文件的完整性.
-
-	注意: 无法修复 20GB 以上文件的 md5!!
-
-	示例:
-
-	1. 修复 /我的资源/1.mp4 的 MD5 值
-	BaiduPCS-Go fixmd5 /我的资源/1.mp4
-`,
-			Category: "百度网盘",
-			Before:   reloadFn,
-			Action: func(c *cli.Context) error {
-				if c.NArg() <= 0 {
-					cli.ShowCommandHelp(c, c.Command.Name)
-					return nil
-				}
-
-				pcscommand.RunFixMD5(c.Args()...)
-				return nil
-			},
-		},
-		{
 			Name:      "sumfile",
 			Aliases:   []string{"sf"},
-			Usage:     "获取本地文件的秒传信息",
+			Usage:     "获取本地文件的秒传信息(目前秒传功能已失效)",
 			UsageText: app.Name + " sumfile <本地文件的路径1> <本地文件的路径2> ...",
 			Description: `
-	获取本地文件的大小, md5, 前256KB切片的md5, crc32, 可用于秒传文件.
+	获取本地文件的大小, md5, 前256KB切片的md5, crc32, 曾经可用于秒传文件.
 
 	示例:
 
@@ -1329,7 +1670,8 @@ func main() {
 
 					strLength, strMd5, strSliceMd5, strCrc32 := strconv.FormatInt(lp.Length, 10), hex.EncodeToString(lp.MD5), hex.EncodeToString(lp.SliceMD5), strconv.FormatUint(uint64(lp.CRC32), 10)
 					fileName := filepath.Base(filePath)
-
+					regFileName := strings.Replace(fileName, " ", "_", -1)
+					regFileName = strings.Replace(regFileName, "#", "_", -1)
 					tb := pcstable.NewTable(os.Stdout)
 					tb.SetColumnAlignment([]int{tablewriter.ALIGN_LEFT, tablewriter.ALIGN_LEFT})
 					tb.AppendBulk([][]string{
@@ -1338,12 +1680,63 @@ func main() {
 						[]string{"前256KB切片的md5", strSliceMd5},
 						[]string{"crc32", strCrc32},
 						[]string{"秒传命令", app.Name + " rapidupload -length=" + strLength + " -md5=" + strMd5 + " -slicemd5=" + strSliceMd5 + " -crc32=" + strCrc32 + " " + fileName},
+						[]string{"通用秒传链接", strMd5 + "#" + strSliceMd5 + "#" + strLength + "#" + regFileName},
 					})
 					tb.Render()
 					fmt.Printf("\n")
 				}
 
 				return nil
+			},
+		},
+		{
+			Name:      "transfer",
+			Usage:     "转存文件/目录",
+			UsageText: app.Name + " transfer <分享链接> <提取码>(如果有)",
+			Category:  "百度网盘",
+			Before:    reloadFn,
+			Description: `
+			转存文件/目录
+	如果没有提取码或为整合式链接，则第二个位置留空；只能转存到当前网盘目录下，
+	分享链接支持常规百度云链接, 支持长短秒传链接
+	
+	实例：
+	BaiduPCS-Go transfer pan.baidu.com/s/1VYzSl7465sdrQXe8GT5RdQ 704e
+	BaiduPCS-Go transfer https://pan.baidu.com/s/1VYzSl7465sdrQXe8GT5RdQ 704e
+	BaiduPCS-Go transfer https://pan.baidu.com/s/1VYzSl7465sdrQXe8GT5RdQ?pwd=704e
+
+	`,
+			Action: func(c *cli.Context) error {
+				if c.NArg() < 1 || c.NArg() > 2 {
+					cli.ShowCommandHelp(c, c.Command.Name)
+					return nil
+				}
+				opt := &baidupcs.TransferOption{
+					Download: c.Bool("download"),
+					Collect:  c.Bool("collect"),
+					Rname:    c.Bool("rname"),
+					FsID:     c.String("fs_id"),
+				}
+				pcscommand.RunShareTransfer(c.Args(), opt)
+				return nil
+			},
+			Flags: []cli.Flag{
+				cli.BoolFlag{
+					Name:  "download",
+					Usage: "转存后直接下载到本地默认目录",
+				},
+				cli.BoolFlag{
+					Name:  "collect",
+					Usage: "多文件整合到一个文件夹中转存",
+				},
+				cli.BoolFlag{
+					Name:  "rname",
+					Usage: "秒传随机替换4位文件名提高成功率",
+				},
+				cli.StringFlag{
+					Name:  "fs_id",
+					Usage: "指定特定fs_id进行转存(用于绕过大文件夹数量限制)",
+				},
 			},
 		},
 		{
@@ -1362,14 +1755,35 @@ func main() {
 					Aliases:     []string{"s"},
 					Usage:       "设置分享文件/目录",
 					UsageText:   app.Name + " share set <文件/目录1> <文件/目录2> ...",
-					Description: `目前只支持创建私密链接.`,
+					Description: `支持任意有效天数, 支持自定义提取码.`,
 					Action: func(c *cli.Context) error {
 						if c.NArg() < 1 {
 							cli.ShowCommandHelp(c, c.Command.Name)
 							return nil
 						}
-						pcscommand.RunShareSet(c.Args(), nil)
+						opt := &baidupcs.ShareOption{
+							Password:   c.String("p"),
+							Period:     c.Int("period"),
+							IsCombined: c.Bool("f"),
+						}
+						pcscommand.RunShareSet(c.Args(), opt)
 						return nil
+					},
+					Flags: []cli.Flag{
+						cli.StringFlag{
+							Name:  "p",
+							Usage: "提取码",
+							Value: "",
+						},
+						cli.IntFlag{
+							Name:  "period",
+							Usage: "有效天数, 0为永久",
+							Value: 0,
+						},
+						cli.BoolFlag{
+							Name:  "f",
+							Usage: "输出带密码的完整链接格式",
+						},
 					},
 				},
 				{
@@ -1415,6 +1829,7 @@ func main() {
 	导出网盘内的文件或目录, 原理为秒传文件, 此操作会生成导出文件或目录的命令.
 
 	注意!!! :
+	由于秒传已经失效, 导出信息已无法用做公开分享
 	无法导出 20GB 以上的文件!!
 	无法导出文件的版本历史等数据!!
 	并不是所有的文件都能导出成功, 程序会列出无法导出的文件列表.
@@ -1439,10 +1854,12 @@ func main() {
 				}
 
 				pcscommand.RunExport(pcspaths, &pcscommand.ExportOptions{
-					RootPath:  c.String("root"),
-					SavePath:  c.String("out"),
-					MaxRetry:  c.Int("retry"),
-					Recursive: c.Bool("r"),
+					RootPath:   c.String("root"),
+					SavePath:   c.String("out"),
+					MaxRetry:   c.Int("retry"),
+					Recursive:  c.Bool("r"),
+					LinkFormat: c.Bool("link"),
+					StdOut:     c.Bool("stdout"),
 				})
 				return nil
 			},
@@ -1463,6 +1880,14 @@ func main() {
 				cli.BoolFlag{
 					Name:  "r",
 					Usage: "递归导出",
+				},
+				cli.BoolFlag{
+					Name:  "link",
+					Usage: "以通用秒传链接格式导出(将丢失路径信息)",
+				},
+				cli.BoolFlag{
+					Name:  "stdout",
+					Usage: "导出信息不存文件, 直接打印至标准输出",
 				},
 			},
 		},
@@ -1715,7 +2140,7 @@ func main() {
 
 		谨慎修改 appid, user_agent, pcs_ua, pan_ua 的值, 否则访问网盘服务器时, 可能会出现错误
 		cache_size 的值支持可选设置单位了, 单位不区分大小写, b 和 B 均表示字节的意思, 如 64KB, 1MB, 32kb, 65536b, 65536
-		max_upload_parallel, max_download_load 的值支持可选设置单位了, 单位为每秒的传输速率, 后缀'/s' 可省略, 如 2MB/s, 2MB, 2m, 2mb 均为一个意思
+		max_download_rate, max_upload_rate 的值支持可选设置单位了, 单位为每秒的传输速率, 后缀'/s' 可省略, 如 2MB/s, 2MB, 2m, 2mb 均为一个意思
 
 	例子:
 		BaiduPCS-Go config set -appid=266719
@@ -1735,11 +2160,30 @@ func main() {
 						if c.IsSet("enable_https") {
 							pcsconfig.Config.SetEnableHTTPS(c.Bool("enable_https"))
 						}
+						if c.IsSet("ignore_illegal") {
+							pcsconfig.Config.SetIgnoreIllegal(c.Bool("ignore_illegal"))
+						}
+						if c.IsSet("force_login_username") {
+							pcsconfig.Config.SetForceLogin(c.String("force_login_username"))
+						}
 						if c.IsSet("user_agent") {
 							pcsconfig.Config.SetUserAgent(c.String("user_agent"))
 						}
 						if c.IsSet("pcs_ua") {
 							pcsconfig.Config.SetPCSUA(c.String("pcs_ua"))
+						}
+						if c.IsSet("pcs_addr") {
+							match := pcsconfig.Config.SETPCSAddr(c.String("pcs_addr"))
+							if !match {
+								fmt.Println("设置 pcs_addr 错误: pcs服务器地址不合法")
+								return nil
+							}
+						}
+						if c.IsSet("fix_pcs_addr") {
+							pcsconfig.Config.SetStaticPCSAddr(c.Bool("fix_pcs_addr"))
+						}
+						if c.IsSet("upload_policy") {
+							pcsconfig.Config.SetUploadPolicy(c.String("upload_policy"))
 						}
 						if c.IsSet("pan_ua") {
 							pcsconfig.Config.SetPanUA(c.String("pan_ua"))
@@ -1760,6 +2204,9 @@ func main() {
 						if c.IsSet("max_download_load") {
 							pcsconfig.Config.MaxDownloadLoad = c.Int("max_download_load")
 						}
+						if c.IsSet("max_upload_load") {
+							pcsconfig.Config.MaxUploadLoad = c.Int("max_upload_load")
+						}
 						if c.IsSet("max_download_rate") {
 							err := pcsconfig.Config.SetMaxDownloadRateByStr(c.String("max_download_rate"))
 							if err != nil {
@@ -1779,6 +2226,9 @@ func main() {
 						}
 						if c.IsSet("proxy") {
 							pcsconfig.Config.SetProxy(c.String("proxy"))
+						}
+						if c.IsSet("proxy_hostnames") {
+							pcsconfig.Config.SetProxyHostnames(c.String("proxy_hostnames"))
 						}
 						if c.IsSet("local_addrs") {
 							pcsconfig.Config.SetLocalAddrs(c.String("local_addrs"))
@@ -1806,15 +2256,19 @@ func main() {
 						},
 						cli.IntFlag{
 							Name:  "max_parallel",
-							Usage: "下载网络连接的最大并发量",
+							Usage: "下载网络全部连接的最大并发量",
 						},
 						cli.IntFlag{
 							Name:  "max_upload_parallel",
-							Usage: "上传网络连接的最大并发量",
+							Usage: "上传网络单个连接的最大并发量",
 						},
 						cli.IntFlag{
 							Name:  "max_download_load",
 							Usage: "同时进行下载文件的最大数量",
+						},
+						cli.IntFlag{
+							Name:  "max_upload_load",
+							Usage: "同时进行上传文件的最大数量",
 						},
 						cli.StringFlag{
 							Name:  "max_download_rate",
@@ -1832,6 +2286,22 @@ func main() {
 							Name:  "enable_https",
 							Usage: "启用 https",
 						},
+						cli.BoolFlag{
+							Name:  "ignore_illegal",
+							Usage: "忽略上传时文件名中的非法字符",
+						},
+						cli.StringFlag{
+							Name:  "force_login_username",
+							Usage: "强制登录指定用户名, 只适用于tieba接口失效的情况",
+						},
+						cli.BoolFlag{
+							Name:  "no_check",
+							Usage: "关闭下载文件md5校验",
+						},
+						cli.StringFlag{
+							Name:  "upload_policy",
+							Usage: "设置上传遇到同名文件时的策略",
+						},
 						cli.StringFlag{
 							Name:  "user_agent",
 							Usage: "浏览器标识",
@@ -1839,6 +2309,14 @@ func main() {
 						cli.StringFlag{
 							Name:  "pcs_ua",
 							Usage: "PCS 浏览器标识",
+						},
+						cli.StringFlag{
+							Name:  "pcs_addr",
+							Usage: "PCS 服务器地址",
+						},
+						cli.BoolFlag{
+							Name:  "fix_pcs_addr",
+							Usage: "使用静态PCS 服务器",
 						},
 						cli.StringFlag{
 							Name:  "pan_ua",
@@ -1849,9 +2327,30 @@ func main() {
 							Usage: "设置代理, 支持 http/socks5 代理",
 						},
 						cli.StringFlag{
+							Name:  "proxy_hostnames",
+							Usage: "设置走代理的域名范围, 多个域名用逗号隔开, 留空则所有域名均代理",
+						},
+						cli.StringFlag{
 							Name:  "local_addrs",
 							Usage: "设置本地网卡地址, 多个地址用逗号隔开",
 						},
+					},
+				},
+				{
+					Name:        "reset",
+					Usage:       "恢复默认配置项",
+					UsageText:   app.Name + " config reset",
+					Description: "",
+					Action: func(c *cli.Context) error {
+						pcsconfig.Config.InitDefaultConfig()
+						err := pcsconfig.Config.Save()
+						if err != nil {
+							fmt.Println(err)
+							return err
+						}
+						pcsconfig.Config.PrintTable()
+						fmt.Println("恢复默认配置成功")
+						return nil
 					},
 				},
 			},

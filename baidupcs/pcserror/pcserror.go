@@ -2,7 +2,7 @@
 package pcserror
 
 import (
-	"github.com/felixonmars/BaiduPCS-Go/pcsutil/jsonhelper"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil/jsonhelper"
 	"io"
 )
 
@@ -53,15 +53,21 @@ const (
 )
 
 // DecodePCSJSONError 解析PCS JSON的错误
-func DecodePCSJSONError(opreation string, data io.Reader) Error {
-	errInfo := NewPCSErrorInfo(opreation)
-	return HandleJSONParse(opreation, data, errInfo)
+func DecodePCSJSONError(operation string, data io.Reader) Error {
+	errInfo := NewPCSErrorInfo(operation)
+	return HandleJSONParse(operation, data, errInfo)
 }
 
 // DecodePanJSONError 解析Pan JSON的错误
-func DecodePanJSONError(opreation string, data io.Reader) Error {
-	errInfo := NewPanErrorInfo(opreation)
-	return HandleJSONParse(opreation, data, errInfo)
+func DecodePanJSONError(operation string, data io.Reader) Error {
+	errInfo := NewPanErrorInfo(operation)
+	return HandleJSONParse(operation, data, errInfo)
+}
+
+// DecodeXPanJSONError 解析XPan JSON的错误
+func DecodeXPanJSONError(operation string, data io.Reader) Error {
+	errInfo := NewXPanErrorInfo(operation)
+	return HandleJSONParse(operation, data, errInfo)
 }
 
 // HandleJSONParse 处理解析json
@@ -85,6 +91,5 @@ func HandleJSONParse(op string, data io.Reader, info interface{}) (pcsError Erro
 		errInfo.SetRemoteError()
 		return errInfo
 	}
-
 	return nil
 }

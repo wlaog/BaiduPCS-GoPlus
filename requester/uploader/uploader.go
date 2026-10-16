@@ -2,11 +2,11 @@
 package uploader
 
 import (
-	"github.com/felixonmars/BaiduPCS-Go/pcsutil"
-	"github.com/felixonmars/BaiduPCS-Go/pcsutil/converter"
-	"github.com/felixonmars/BaiduPCS-Go/pcsverbose"
-	"github.com/felixonmars/BaiduPCS-Go/requester"
-	"github.com/felixonmars/BaiduPCS-Go/requester/rio"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil/converter"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsverbose"
+	"github.com/qjfoidnh/BaiduPCS-Go/requester"
+	"github.com/qjfoidnh/BaiduPCS-Go/requester/rio"
 	"net/http"
 	"time"
 )
@@ -60,7 +60,7 @@ func (u *Uploader) lazyInit() {
 		u.client = requester.NewHTTPClient()
 	}
 	u.client.SetTimeout(0)
-	u.client.SetResponseHeaderTimeout(0)
+	u.client.SetResponseHeaderTimeout(10 * time.Second)
 }
 
 // SetClient 设置http客户端

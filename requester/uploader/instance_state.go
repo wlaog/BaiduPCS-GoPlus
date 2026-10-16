@@ -1,7 +1,7 @@
 package uploader
 
 import (
-	"github.com/felixonmars/BaiduPCS-Go/requester/transfer"
+	"github.com/qjfoidnh/BaiduPCS-Go/requester/transfer"
 )
 
 type (
@@ -15,6 +15,7 @@ type (
 	// InstanceState 上传断点续传信息
 	InstanceState struct {
 		BlockList []*BlockState `json:"block_list"`
+		Uploadid  string        `json:"uploadid"`
 	}
 )
 

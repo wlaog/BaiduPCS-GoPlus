@@ -1,9 +1,11 @@
 package pcsconfig
 
 import (
-	"github.com/felixonmars/BaiduPCS-Go/pcsutil/converter"
-	"github.com/felixonmars/BaiduPCS-Go/requester"
+	"regexp"
 	"strings"
+
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil/converter"
+	"github.com/qjfoidnh/BaiduPCS-Go/requester"
 )
 
 const (
@@ -81,7 +83,7 @@ func (c *PCSConfig) manipUser(op string, baiduBase *BaiduBase) (*Baidu, error) {
 	return nil, ErrBaiduUserNotFound
 }
 
-//setupNewUser 从已有用户中, 设置新的当前登录用户
+// setupNewUser 从已有用户中, 设置新的当前登录用户
 func (c *PCSConfig) setupNewUser(user *Baidu) {
 	if user == nil {
 		return
@@ -112,9 +114,17 @@ func (c *PCSConfig) CheckBaiduUserExist(baidubase *BaiduBase) bool {
 	return err == nil
 }
 
-// SetupUserByBDUSS 设置百度 bduss, ptoken, stoken 并保存
-func (c *PCSConfig) SetupUserByBDUSS(bduss, ptoken, stoken string) (baidu *Baidu, err error) {
-	b, err := NewUserInfoByBDUSS(bduss)
+// SetupUserByBDUSS 设置百度 bduss, ptoken, stoken, cookies 并保存
+func (c *PCSConfig) SetupUserByBDUSS(bduss, ptoken, stoken, cookies string) (baidu *Baidu, err error) {
+	if bduss == "" && cookies != "" {
+		re, _ := regexp.Compile(`BDUSS=(.+?);`)
+		sub := re.FindSubmatch([]byte(cookies))
+		bduss = string(sub[1])
+	}
+	b, err := NewUserInfoByInput(bduss, c.ForceLogin)
+	if c.ForceLogin == "" {
+		b, err = NewUserInfoByBDUSS(bduss)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -123,8 +133,9 @@ func (c *PCSConfig) SetupUserByBDUSS(bduss, ptoken, stoken string) (baidu *Baidu
 		UID: b.UID,
 	}) // 删除旧的信息
 
-	b.PTOKEN = ptoken
+	b.PTOKEN = ptoken // 实际未使用
 	b.STOKEN = stoken
+	b.COOKIES = cookies
 
 	c.BaiduUserList = append(c.BaiduUserList, b)
 
@@ -193,6 +204,26 @@ func (c *PCSConfig) SetPanUA(panUA string) {
 	}
 }
 
+// SetPCSAddr 设置 PCS 服务器地址
+func (c *PCSConfig) SETPCSAddr(pcsaddr string) bool {
+	match, _ := regexp.MatchString("^([cd]\\d?\\.)?pcs\\.baidu\\.com", pcsaddr)
+	if match {
+		c.PCSAddr = pcsaddr
+		if c.pcs != nil {
+			c.pcs.SetPCSAddr(pcsaddr)
+		}
+	}
+	return match
+}
+
+// SetStaticPCSAddr 设置上传时是否关闭动态PCS域名
+func (c *PCSConfig) SetStaticPCSAddr(static bool) {
+	c.FixPCSAddr = static
+	if c.pcs != nil {
+		c.pcs.SetStaticPCSAddr(static)
+	}
+}
+
 // SetEnableHTTPS 设置是否启用https
 func (c *PCSConfig) SetEnableHTTPS(https bool) {
 	c.EnableHTTPS = https
@@ -201,14 +232,39 @@ func (c *PCSConfig) SetEnableHTTPS(https bool) {
 	}
 }
 
+func (c *PCSConfig) SetNoCheck(nocheck bool) {
+	c.NoCheck = nocheck
+}
+
+// SetUploadPolicy 设置上传文件重名时的处理策略
+func (c *PCSConfig) SetUploadPolicy(upolicy string) {
+	c.UPolicy = upolicy
+}
+
 // SetProxy 设置代理
 func (c *PCSConfig) SetProxy(proxy string) {
 	c.Proxy = proxy
 	requester.SetGlobalProxy(proxy)
 }
 
+// SetProxyHostnames 设置代理域名列表
+func (c *PCSConfig) SetProxyHostnames(proxyHostnames string) {
+	c.ProxyHostnames = proxyHostnames
+	requester.SetProxyHostnameRules(proxyHostnames)
+}
+
 // SetLocalAddrs 设置localAddrs
 func (c *PCSConfig) SetLocalAddrs(localAddrs string) {
 	c.LocalAddrs = localAddrs
 	requester.SetLocalTCPAddrList(strings.Split(localAddrs, ",")...)
+}
+
+// SetIgnoreIllegal 设置忽略上传文件名非法字符
+func (c *PCSConfig) SetIgnoreIllegal(ignore bool) {
+	c.IgnoreIllegal = ignore
+}
+
+// SetForceLogin 设置强制登录
+func (c *PCSConfig) SetForceLogin(username string) {
+	c.ForceLogin = username
 }

@@ -4,14 +4,14 @@ package downloader
 import (
 	"context"
 	"errors"
-	"github.com/felixonmars/BaiduPCS-Go/pcsutil"
-	"github.com/felixonmars/BaiduPCS-Go/pcsutil/cachepool"
-	"github.com/felixonmars/BaiduPCS-Go/pcsutil/prealloc"
-	"github.com/felixonmars/BaiduPCS-Go/pcsutil/waitgroup"
-	"github.com/felixonmars/BaiduPCS-Go/pcsverbose"
-	"github.com/felixonmars/BaiduPCS-Go/requester"
-	"github.com/felixonmars/BaiduPCS-Go/requester/rio/speeds"
-	"github.com/felixonmars/BaiduPCS-Go/requester/transfer"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil/cachepool"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil/converter"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil/waitgroup"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsverbose"
+	"github.com/qjfoidnh/BaiduPCS-Go/requester"
+	"github.com/qjfoidnh/BaiduPCS-Go/requester/rio/speeds"
+	"github.com/qjfoidnh/BaiduPCS-Go/requester/transfer"
 	"io"
 	"net/http"
 	"sync"
@@ -22,6 +22,8 @@ const (
 	// DefaultAcceptRanges 默认的 Accept-Ranges
 	DefaultAcceptRanges = "bytes"
 )
+
+var BlockSizeList = [4]int64{256 * converter.KB, 512 * converter.KB, 1 * converter.MB, 4 * converter.MB}
 
 type (
 	// Downloader 下载
@@ -56,7 +58,7 @@ type (
 	StatusCodeBodyCheckFunc func(respBody io.Reader) error
 )
 
-//NewDownloader 初始化Downloader
+// NewDownloader 初始化Downloader
 func NewDownloader(durl string, writer io.WriterAt, config *Config) (der *Downloader) {
 	der = &Downloader{
 		durl:   durl,
@@ -73,7 +75,7 @@ func (der *Downloader) SetFirstInfo(i *DownloadFirstInfo) {
 	der.firstInfo = i
 }
 
-//SetClient 设置http客户端
+// SetClient 设置http客户端
 func (der *Downloader) SetClient(client *requester.HTTPClient) {
 	der.client = client
 }
@@ -83,12 +85,21 @@ func (der *Downloader) SetDURLCheckFunc(f DURLCheckFunc) {
 	der.durlCheckFunc = f
 }
 
+func (der *Downloader) SetFileContentLength(length int64) {
+	if der.firstInfo == nil {
+		der.firstInfo = &DownloadFirstInfo{
+			ContentLength: length,
+			AcceptRanges:  DefaultAcceptRanges,
+		}
+	}
+}
+
 // SetLoadBalancerCompareFunc 设置负载均衡检测函数
 func (der *Downloader) SetLoadBalancerCompareFunc(f LoadBalancerCompareFunc) {
 	der.loadBalancerCompareFunc = f
 }
 
-//SetStatusCodeBodyCheckFunc 设置响应状态码出错的检查函数, 当FirstCheckMethod不为HEAD时才有效
+// SetStatusCodeBodyCheckFunc 设置响应状态码出错的检查函数, 当FirstCheckMethod不为HEAD时才有效
 func (der *Downloader) SetStatusCodeBodyCheckFunc(f StatusCodeBodyCheckFunc) {
 	der.statusCodeBodyCheckFunc = f
 }
@@ -99,7 +110,7 @@ func (der *Downloader) lazyInit() {
 	}
 	if der.client == nil {
 		der.client = requester.NewHTTPClient()
-		der.client.SetTimeout(20 * time.Minute)
+		der.client.SetTimeout(2 * time.Minute)
 	}
 	if der.monitor == nil {
 		der.monitor = NewMonitor()
@@ -121,8 +132,8 @@ func (der *Downloader) SelectParallel(single bool, maxParallel int, totalSize in
 		parallel = len(instanceRangeList)
 	} else {
 		parallel = der.config.MaxParallel
-		if int64(parallel) > totalSize/int64(MinParallelSize) {
-			parallel = int(totalSize/int64(MinParallelSize)) + 1
+		if int64(parallel) > totalSize/MinParallelSize {
+			parallel = int(totalSize/MinParallelSize) + 1
 		}
 	}
 
@@ -146,14 +157,17 @@ func (der *Downloader) SelectBlockSizeAndInitRangeGen(single bool, status *trans
 			gen = transfer.NewRangeListGenDefault(status.TotalSize(), 0, 0, parallel)
 			blockSize = gen.LoadBlockSize()
 		case transfer.RangeGenMode_BlockSize:
-			b2 := status.TotalSize()/int64(parallel) + 1
-			if b2 > der.config.BlockSize { // 选小的BlockSize, 以更高并发
-				blockSize = der.config.BlockSize
+			totalSize := status.TotalSize()
+			if totalSize < 5*converter.MB {
+				blockSize = BlockSizeList[0]
+			} else if totalSize < 10*converter.MB {
+				blockSize = BlockSizeList[1]
+			} else if totalSize < 15*converter.MB {
+				blockSize = BlockSizeList[2]
 			} else {
-				blockSize = b2
+				blockSize = BlockSizeList[3]
 			}
-
-			gen = transfer.NewRangeListGenBlockSize(status.TotalSize(), 0, blockSize)
+			gen = transfer.NewRangeListGenBlockSize(totalSize, 0, blockSize)
 		default:
 			initErr = transfer.ErrUnknownRangeGenMode
 			return
@@ -215,11 +229,11 @@ func (der *Downloader) checkLoadBalancers() *LoadBalancerResponseList {
 		URL: der.durl,
 	})
 
-	// 负载均衡
-	wg := waitgroup.NewWaitGroup(10)
+	// 多下载服务器的负载均衡, 在本项目中无意义，因为百度只用单下载服务器
+	wg := waitgroup.NewWaitGroup(4)
 	privTimeout := der.client.Client.Timeout
 	der.client.SetTimeout(5 * time.Second)
-	for _, loadBalanser := range der.loadBalansers {
+	for _, loadBalanser := range der.loadBalansers { // 这里服务器列表数量为0，所以逻辑实际未生效
 		wg.AddDelta()
 		go func(loadBalanser string) {
 			defer wg.Done()
@@ -268,10 +282,9 @@ func (der *Downloader) checkLoadBalancers() *LoadBalancerResponseList {
 	return loadBalancerResponseList
 }
 
-//Execute 开始任务
+// Execute 开始任务
 func (der *Downloader) Execute() error {
 	der.lazyInit()
-
 	var (
 		resp *http.Response
 	)
@@ -374,13 +387,13 @@ func (der *Downloader) Execute() error {
 
 	var writer Writer
 	if !der.config.IsTest {
-		// 尝试修剪文件
-		if fder, ok := der.writer.(Fder); ok {
-			err = prealloc.PreAlloc(fder.Fd(), status.TotalSize())
-			if err != nil {
-				pcsverbose.Verbosef("DEBUG: truncate file error: %s\n", err)
-			}
-		}
+		// 磁盘预分配逻辑, 现在固态硬盘已成主流因此废弃
+		//if fder, ok := der.writer.(Fder); ok {
+		//	err = prealloc.PreAlloc(fder.Fd(), status.TotalSize())
+		//	if err != nil {
+		//		pcsverbose.Verbosef("DEBUG: truncate file error: %s\n", err)
+		//	}
+		//}
 		writer = der.writer // 非测试模式, 赋值writer
 	}
 
@@ -460,7 +473,7 @@ func (der *Downloader) Execute() error {
 	return err
 }
 
-//downloadStatusEvent 执行状态处理事件
+// downloadStatusEvent 执行状态处理事件
 func (der *Downloader) downloadStatusEvent() {
 	if der.onDownloadStatusEvent == nil {
 		return
@@ -481,7 +494,7 @@ func (der *Downloader) downloadStatusEvent() {
 	}()
 }
 
-//Pause 暂停
+// Pause 暂停
 func (der *Downloader) Pause() {
 	if der.monitor == nil {
 		return
@@ -490,7 +503,7 @@ func (der *Downloader) Pause() {
 	der.monitor.Pause()
 }
 
-//Resume 恢复
+// Resume 恢复
 func (der *Downloader) Resume() {
 	if der.monitor == nil {
 		return
@@ -499,7 +512,7 @@ func (der *Downloader) Resume() {
 	der.monitor.Resume()
 }
 
-//Cancel 取消
+// Cancel 取消
 func (der *Downloader) Cancel() {
 	if der.monitor == nil {
 		return
@@ -508,37 +521,37 @@ func (der *Downloader) Cancel() {
 	pcsutil.Trigger(der.monitorCancelFunc)
 }
 
-//OnExecute 设置开始下载事件
+// OnExecute 设置开始下载事件
 func (der *Downloader) OnExecute(onExecuteEvent requester.Event) {
 	der.onExecuteEvent = onExecuteEvent
 }
 
-//OnSuccess 设置成功下载事件
+// OnSuccess 设置成功下载事件
 func (der *Downloader) OnSuccess(onSuccessEvent requester.Event) {
 	der.onSuccessEvent = onSuccessEvent
 }
 
-//OnFinish 设置结束下载事件
+// OnFinish 设置结束下载事件
 func (der *Downloader) OnFinish(onFinishEvent requester.Event) {
 	der.onFinishEvent = onFinishEvent
 }
 
-//OnPause 设置暂停下载事件
+// OnPause 设置暂停下载事件
 func (der *Downloader) OnPause(onPauseEvent requester.Event) {
 	der.onPauseEvent = onPauseEvent
 }
 
-//OnResume 设置恢复下载事件
+// OnResume 设置恢复下载事件
 func (der *Downloader) OnResume(onResumeEvent requester.Event) {
 	der.onResumeEvent = onResumeEvent
 }
 
-//OnCancel 设置取消下载事件
+// OnCancel 设置取消下载事件
 func (der *Downloader) OnCancel(onCancelEvent requester.Event) {
 	der.onCancelEvent = onCancelEvent
 }
 
-//OnDownloadStatusEvent 设置状态处理函数
+// OnDownloadStatusEvent 设置状态处理函数
 func (der *Downloader) OnDownloadStatusEvent(f DownloadStatusFunc) {
 	der.onDownloadStatusEvent = f
 }

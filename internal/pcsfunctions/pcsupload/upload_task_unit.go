@@ -2,18 +2,19 @@ package pcsupload
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"github.com/felixonmars/BaiduPCS-Go/baidupcs"
-	"github.com/felixonmars/BaiduPCS-Go/baidupcs/pcserror"
-	"github.com/felixonmars/BaiduPCS-Go/internal/pcsconfig"
-	"github.com/felixonmars/BaiduPCS-Go/internal/pcsfunctions"
-	"github.com/felixonmars/BaiduPCS-Go/pcsutil/checksum"
-	"github.com/felixonmars/BaiduPCS-Go/pcsutil/converter"
-	"github.com/felixonmars/BaiduPCS-Go/pcsutil/taskframework"
-	"github.com/felixonmars/BaiduPCS-Go/requester/rio"
-	"github.com/felixonmars/BaiduPCS-Go/requester/uploader"
+	"github.com/qjfoidnh/BaiduPCS-Go/baidupcs"
+	"github.com/qjfoidnh/BaiduPCS-Go/baidupcs/pcserror"
+	"github.com/qjfoidnh/BaiduPCS-Go/internal/pcsconfig"
+	"github.com/qjfoidnh/BaiduPCS-Go/internal/pcsfunctions"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil/checksum"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil/converter"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil/taskframework"
+	"github.com/qjfoidnh/BaiduPCS-Go/requester/rio"
+	"github.com/qjfoidnh/BaiduPCS-Go/requester/uploader"
 	"path"
 	"strings"
 	"time"
@@ -28,12 +29,14 @@ type (
 		LocalFileChecksum *checksum.LocalFileChecksum // 要上传的本地文件详情
 		Step              StepUpload
 		SavePath          string // 保存路径
+		PrintFormat       string
 
 		PCS               *baidupcs.BaiduPCS
 		UploadingDatabase *UploadingDatabase // 数据库
 		Parallel          int
-		NoRapidUpload     bool // 禁用秒传
-		NoSplitFile       bool // 禁用分片上传
+		NoRapidUpload     bool   // 禁用秒传
+		NoSplitFile       bool   // 禁用分片上传
+		Policy            string // 上传重名文件策略
 
 		UploadStatistic *UploadStatistic
 
@@ -41,6 +44,8 @@ type (
 		panDir   string
 		panFile  string
 		state    *uploader.InstanceState
+		// prepareResult 区分策略正常跳过与准备阶段真实失败。
+		prepareResult *taskframework.TaskUnitRunResult
 	}
 )
 
@@ -51,10 +56,14 @@ const (
 	StepUploadRapidUpload
 	// StepUploadUpload 正常上传步骤
 	StepUploadUpload
+	// JustGoon 跳过上传
+	JustGoon
 )
 
 const (
-	StrUploadFailed = "上传文件失败"
+	StrUploadFailed    = "上传文件失败"
+	DefaultPrintFormat = "\r[%s] ↑ %s/%s %s/s in %s ............"
+	DefaultContentSize = 4 * converter.KB
 )
 
 func (utu *UploadTaskUnit) SetTaskInfo(taskInfo *taskframework.TaskInfo) {
@@ -72,22 +81,67 @@ func (utu *UploadTaskUnit) prepareFile() {
 
 	// 检测断点续传
 	utu.state = utu.UploadingDatabase.Search(&utu.LocalFileChecksum.LocalFileMeta)
-	if utu.state != nil || utu.LocalFileChecksum.LocalFileMeta.MD5 != nil { // 读取到了md5
-		utu.Step = StepUploadUpload
+	if utu.state != nil || utu.LocalFileChecksum.LocalFileMeta.BlocksList != nil { // 读取到了断点信息
+		// Precomputed hashes do not imply that a resumable upload exists.
+		if utu.state == nil {
+			utu.state = &uploader.InstanceState{}
+		}
+		fmt.Printf("[%s] 检测到断点信息, 准备续传...\n", utu.taskInfo.Id())
+		if utu.LocalFileChecksum.LocalFileMeta.BlocksList != nil {
+			utu.Step = StepUploadRapidUpload // 带校验和的断点: 走原握手流程, 顺带秒传检测
+		} else {
+			utu.Step = StepUploadUpload // --norapid 断点: 免校验和, 直接继续分片上传
+		}
 		return
+	}
+	utu.state = &uploader.InstanceState{}
+
+	if utu.LocalFileChecksum.Length >= baidupcs.RecommendedUploadSize {
+		fmt.Printf("[%s] 文件超过32GB, 上传有可能失败, 建议分割文件...\n", utu.taskInfo.Id())
+	}
+
+	if utu.LocalFileChecksum.Length > baidupcs.MinCheckLeftSpaceThreshold {
+		freeSpace, err := utu.PCS.SpaceLeftInfo()
+		if err == nil && freeSpace < utu.LocalFileChecksum.Length {
+			fmt.Printf("[%s] 目标文件大小超过剩余空间, 跳过...\n", utu.taskInfo.Id())
+			utu.prepareResult = &taskframework.TaskUnitRunResult{
+				ResultMessage: "目标文件大小超过剩余空间",
+				Err:           errors.New("目标文件大小超过百度网盘剩余空间"),
+			}
+			utu.Step = JustGoon
+			return
+		}
 	}
 
 	if utu.NoRapidUpload {
+		//fmt.Printf("[%s] 注意: 跳过秒传将无法使用断点续传...\n", utu.taskInfo.Id())
+		pcsError, jsonData := utu.PCS.FakeRapidUpload(utu.SavePath, utu.Policy, utu.LocalFileChecksum.Length)
+		if pcsError != nil {
+			errcode := pcsError.GetRemoteErrCode()
+			if errcode != 114514 && errcode != 1919810 {
+				fmt.Printf("[%s] 跳过秒传失败, 开始秒传...\n", utu.taskInfo.Id())
+				utu.Step = StepUploadRapidUpload
+				return
+			} else {
+				fmt.Printf("[%s] 目标文件已存在, 跳过...\n", utu.taskInfo.Id())
+				utu.prepareResult = &taskframework.TaskUnitRunResult{
+					Succeed:       true,
+					ResultMessage: "目标文件已存在, 跳过",
+					Extra:         baidupcs.SkipPolicy,
+				}
+				utu.Step = JustGoon
+				return
+			}
+		}
+		utu.state = &uploader.InstanceState{
+			Uploadid: jsonData.UploadID,
+		}
+		utu.UploadingDatabase.Save()
 		utu.Step = StepUploadUpload
 		return
 	}
 
-	if utu.LocalFileChecksum.Length > baidupcs.MaxRapidUploadSize {
-		fmt.Printf("[%s] 文件超过20GB, 无法使用秒传功能, 跳过秒传...\n", utu.taskInfo.Id())
-		utu.Step = StepUploadUpload
-		return
-	}
-	// 下一步: 秒传
+	// 秒传不分文件大小一律进行
 	utu.Step = StepUploadRapidUpload
 }
 
@@ -103,7 +157,7 @@ func (utu *UploadTaskUnit) rapidUpload() (isContinue bool, result *taskframework
 		switch pcsError.GetErrType() {
 		case pcserror.ErrTypeRemoteError:
 			switch pcsError.GetRemoteErrCode() {
-			case 31066:
+			case 31066, -9:
 			// file does not exist
 			// 不缓存文件夹
 			default:
@@ -121,27 +175,26 @@ func (utu *UploadTaskUnit) rapidUpload() (isContinue bool, result *taskframework
 		}
 	}
 
-	// 文件大于128MB, 输出提示信息
-	if utu.LocalFileChecksum.Length >= 128*converter.MB {
-		fmt.Printf("[%s] 检测秒传中, 请稍候...\n", utu.taskInfo.Id())
-	}
+	fmt.Printf("[%s] 开始计算文件元信息, 请稍候...\n", utu.taskInfo.Id())
 
 	// 经测试, 文件的 crc32 值并非秒传文件所必需
-	err := utu.LocalFileChecksum.Sum(checksum.CHECKSUM_MD5 | checksum.CHECKSUM_SLICE_MD5)
-	if err != nil {
-		// 不重试
-		result.ResultMessage = "计算文件秒传信息错误"
-		result.Err = err
-		return
+	if utu.LocalFileChecksum.LocalFileMeta.MD5 == nil || utu.LocalFileChecksum.LocalFileMeta.SliceMD5 == nil {
+		err := utu.LocalFileChecksum.Sum(checksum.CHECKSUM_MD5 | checksum.CHECKSUM_SLICE_MD5)
+		if err != nil {
+			// 不重试
+			result.ResultMessage = "计算文件秒传信息错误"
+			result.Err = err
+			return
+		}
 	}
 
 	// 检测缓存, 通过文件的md5值判断本地文件和网盘文件是否一样
 	if fdl != nil {
 		for _, fd := range fdl {
 			if fd.Filename == utu.panFile {
-				// TODO: fd.MD5 有可能是错误的
 				decodedMD5, _ := hex.DecodeString(fd.MD5)
-				if bytes.Compare(decodedMD5, utu.LocalFileChecksum.MD5) == 0 {
+				// TODO: fd.MD5 有可能是错误的
+				if (utu.Policy == baidupcs.SkipPolicy) || (bytes.Compare(decodedMD5, utu.LocalFileChecksum.MD5) == 0) {
 					fmt.Printf("[%s] 目标文件, %s, 已存在, 跳过...\n", utu.taskInfo.Id(), utu.SavePath)
 					result.Succeed = true // 成功
 					return
@@ -150,30 +203,93 @@ func (utu *UploadTaskUnit) rapidUpload() (isContinue bool, result *taskframework
 		}
 	}
 
-	pcsError = utu.PCS.RapidUpload(utu.SavePath, hex.EncodeToString(utu.LocalFileChecksum.MD5), hex.EncodeToString(utu.LocalFileChecksum.SliceMD5), fmt.Sprint(utu.LocalFileChecksum.CRC32), utu.LocalFileChecksum.Length)
-	if pcsError == nil {
-		fmt.Printf("[%s] 秒传成功, 保存到网盘路径: %s\n\n", utu.taskInfo.Id(), utu.SavePath)
-		// 统计
-		utu.UploadStatistic.AddTotalSize(utu.LocalFileChecksum.Length)
-		result.Succeed = true // 成功
+	uk, pcsError := utu.PCS.CacheUK()
+	if pcsError != nil {
+		result.ResultMessage = "获取用户uk错误, 请确保登录信息包含了STOKEN"
+		result.Err = pcsError
 		return
 	}
+	currentTime := time.Now().Unix()
+	offset, err := creaetDataOffset(hex.EncodeToString(utu.LocalFileChecksum.MD5), uk, currentTime, utu.LocalFileChecksum.Length, DefaultContentSize)
+	if err != nil {
+		result.ResultMessage = "计算文件偏移量错误"
+		result.Err = err
+		return
+	}
+	dataContent, dataLength, err := utu.LocalFileChecksum.GetSliceDataContent(offset, DefaultContentSize)
+	if err != nil {
+		result.ResultMessage = "读取随机文件子片段错误"
+		result.Err = err
+		return
+	}
+	b64Content := strings.TrimRight(base64.StdEncoding.EncodeToString(dataContent), "=")
 
-	// 判断配额是否已满
-	switch pcsError.GetErrType() {
-	// 远程服务器错误
-	case pcserror.ErrTypeRemoteError:
-		switch pcsError.GetRemoteErrCode() {
-		case 31112: //exceed quota
-			result.ResultMessage = "秒传失败, 超出配额, 网盘容量已满"
+	blockSize := getBlockSize(utu.LocalFileChecksum.Length)
+
+	fmt.Printf("[%s] 开始计算文件分块md5, 请稍候...\n", utu.taskInfo.Id())
+	if utu.LocalFileChecksum.LocalFileMeta.BlocksList == nil || len(utu.LocalFileChecksum.LocalFileMeta.BlocksList) == 0 {
+		err = utu.LocalFileChecksum.CalculateChunkedSum(blockSize)
+		if err != nil {
+			// 不重试
+			result.ResultMessage = "计算文件分块md5出错"
+			result.Err = err
 			return
 		}
 	}
 
-	fmt.Printf("[%s] 秒传失败, 开始上传文件...\n\n", utu.taskInfo.Id())
+	pcsError, jsonData := utu.PCS.RapidUpload(utu.SavePath, utu.Policy, utu.state.Uploadid, hex.EncodeToString(utu.LocalFileChecksum.MD5),
+		hex.EncodeToString(utu.LocalFileChecksum.SliceMD5), b64Content, fmt.Sprint(utu.LocalFileChecksum.CRC32),
+		offset, dataLength, utu.LocalFileChecksum.Length, currentTime, utu.LocalFileChecksum.BlocksList)
+	if pcsError == nil {
+		if jsonData.ReturnType == 2 {
+			fmt.Printf("[%s] 秒传成功, 保存到网盘路径: %s\n\n", utu.taskInfo.Id(), utu.SavePath)
+			// 统计
+			utu.UploadStatistic.AddTotalSize(utu.LocalFileChecksum.Length)
+			result.Succeed = true // 成功
+			return
+		}
+	} else {
+		// 判断配额是否已满
+		switch pcsError.GetErrType() {
+		// 远程服务器错误
+		case pcserror.ErrTypeRemoteError:
+			switch pcsError.GetRemoteErrCode() {
+			case 31112: //exceed quota
+				result.ResultMessage = "秒传失败, 超出配额, 网盘容量已满"
+			case 114514:
+				// 自定义错误码, 仅在skip策略下出现
+				result.ResultMessage = StrUploadFailed
+				result.Err = pcsError
+				if utu.Policy == baidupcs.SkipPolicy {
+					result.Extra = baidupcs.SkipPolicy
+					result.Err = nil
+					result.ResultMessage = fmt.Sprintf("%s 目标已存在, 跳过", utu.SavePath)
+				}
+				result.NeedRetry = false
+				return
+			case 1919810:
+				// 自定义错误码, 仅在rsync策略下出现
+				result.Extra = baidupcs.SkipPolicy
+				result.Err = nil
+				result.ResultMessage = fmt.Sprintf("%s 目标大小未发生改变, 跳过", utu.SavePath)
+				result.NeedRetry = false
+				return
+			}
+		}
+		return
+	}
+
+	fmt.Printf("[%s] 开始上传文件...\n\n", utu.taskInfo.Id())
 
 	// 保存秒传信息
-	utu.UploadingDatabase.UpdateUploading(&utu.LocalFileChecksum.LocalFileMeta, nil)
+	if utu.state.Uploadid == "" {
+		utu.state.Uploadid = jsonData.UploadID
+	}
+	//else {
+	//	utu.UploadingDatabase.UpdateFullBlock(&utu.LocalFileChecksum.LocalFileMeta, utu.state)
+	//}
+
+	utu.UploadingDatabase.UpdateUploading(&utu.LocalFileChecksum.LocalFileMeta, utu.state)
 	utu.UploadingDatabase.Save()
 	isContinue = true
 	return
@@ -183,34 +299,35 @@ func (utu *UploadTaskUnit) rapidUpload() (isContinue bool, result *taskframework
 func (utu *UploadTaskUnit) upload() (result *taskframework.TaskUnitRunResult) {
 	utu.Step = StepUploadUpload
 
-	var blockSize int64
-	if utu.NoSplitFile {
-		// 不分片上传
-		blockSize = utu.LocalFileChecksum.Length
-	} else {
-		blockSize = getBlockSize(utu.LocalFileChecksum.Length)
-	}
+	blockSize := getBlockSize(utu.LocalFileChecksum.Length)
 
 	muer := uploader.NewMultiUploader(NewPCSUpload(utu.PCS, utu.SavePath), rio.NewFileReaderAtLen64(utu.LocalFileChecksum.GetFile()), &uploader.MultiUploaderConfig{
 		Parallel:  utu.Parallel,
 		BlockSize: blockSize,
 		MaxRate:   pcsconfig.Config.MaxUploadRate,
-	})
+		Policy:    utu.Policy,
+	}, utu.SavePath)
 
 	// 设置断点续传
 	if utu.state != nil {
 		muer.SetInstanceState(utu.state)
 	}
 
+	// 注册上传器, 供优雅退出时停止; 函数结束时注销
+	RegisterActiveUploader(muer)
+	defer UnregisterActiveUploader(muer)
+
 	muer.OnUploadStatusEvent(func(status uploader.Status, updateChan <-chan struct{}) {
 		select {
 		case <-updateChan:
-			utu.UploadingDatabase.UpdateUploading(&utu.LocalFileChecksum.LocalFileMeta, muer.InstanceState())
-			utu.UploadingDatabase.Save()
+			if utu.state.Uploadid != "" {
+				utu.UploadingDatabase.UpdateUploading(&utu.LocalFileChecksum.LocalFileMeta, muer.InstanceState())
+				utu.UploadingDatabase.Save()
+			}
 		default:
 		}
 
-		fmt.Printf("\r[%s] ↑ %s/%s %s/s in %s ............", utu.taskInfo.Id(),
+		fmt.Printf(utu.PrintFormat, utu.taskInfo.Id(),
 			converter.ConvertFileSize(status.Uploaded(), 2),
 			converter.ConvertFileSize(status.TotalSize(), 2),
 			converter.ConvertFileSize(status.SpeedsPerSecond(), 2),
@@ -220,6 +337,15 @@ func (utu *UploadTaskUnit) upload() (result *taskframework.TaskUnitRunResult) {
 
 	// result
 	result = &taskframework.TaskUnitRunResult{}
+	muer.OnCancel(func() {
+		fmt.Printf("\n")
+		fmt.Printf("[%s] 上传已取消, 保存上传进度...\n", utu.taskInfo.Id())
+		if utu.state.Uploadid != "" {
+			utu.UploadingDatabase.UpdateUploading(&utu.LocalFileChecksum.LocalFileMeta, muer.InstanceState())
+			utu.UploadingDatabase.Save()
+		}
+		result.ResultMessage = "用户取消上传"
+	})
 	muer.OnSuccess(func() {
 		fmt.Printf("\n")
 		fmt.Printf("[%s] 上传文件成功, 保存到网盘路径: %s\n", utu.taskInfo.Id(), utu.SavePath)
@@ -246,6 +372,24 @@ func (utu *UploadTaskUnit) upload() (result *taskframework.TaskUnitRunResult) {
 		case pcserror.ErrTypeRemoteError:
 			// 远程百度服务器的错误
 			switch pcsError.GetRemoteErrCode() {
+			case 114514:
+				// 自定义错误码, 仅在skip策略下出现
+				result.ResultMessage = StrUploadFailed
+				result.Err = pcsError
+				if utu.Policy == baidupcs.SkipPolicy {
+					result.Extra = baidupcs.SkipPolicy
+					result.Err = nil
+					result.ResultMessage = fmt.Sprintf("%s 目标已存在, 跳过", utu.SavePath)
+				}
+				result.NeedRetry = false
+				return
+			case 1919810:
+				// 自定义错误码, 仅在rsync策略下出现
+				result.Extra = baidupcs.SkipPolicy
+				result.Err = nil
+				result.ResultMessage = fmt.Sprintf("%s 目标大小未发生改变, 跳过", utu.SavePath)
+				result.NeedRetry = false
+				return
 			case 31363:
 				// block miss in superfile2, 上传状态过期
 				// 需要重试的
@@ -254,10 +398,17 @@ func (utu *UploadTaskUnit) upload() (result *taskframework.TaskUnitRunResult) {
 
 				result.ResultMessage = StrUploadFailed
 				result.Err = errors.New("上传状态过期, 重新上传")
-			case 31200:
-				//服务器错误
-				//[Method:Insert][Error:Insert Request Forbid]
-				// do nothing
+			case 31061:
+				// 已存在重名文件, 不重试
+				result.ResultMessage = StrUploadFailed
+				result.Err = pcsError
+				if utu.Policy == baidupcs.SkipPolicy {
+					result.Extra = baidupcs.SkipPolicy
+					result.Err = nil
+					result.ResultMessage = fmt.Sprintf("%s 目标已存在, 跳过", utu.SavePath)
+				}
+				result.NeedRetry = false
+				return
 			default:
 				result.ResultMessage = StrUploadFailed
 				result.Err = pcsError
@@ -314,13 +465,37 @@ func (utu *UploadTaskUnit) RetryWait() time.Duration {
 	return pcsfunctions.RetryWait(utu.taskInfo.Retry())
 }
 
+func (utu *UploadTaskUnit) runPreparedStep() *taskframework.TaskUnitRunResult {
+	if utu.prepareResult != nil {
+		return utu.prepareResult
+	}
+	return &taskframework.TaskUnitRunResult{
+		ResultMessage: StrUploadFailed,
+		Err:           errors.New("上传准备阶段未生成结果"),
+	}
+}
+
 func (utu *UploadTaskUnit) Run() (result *taskframework.TaskUnitRunResult) {
 	fmt.Printf("[%s] 准备上传: %s\n", utu.taskInfo.Id(), utu.LocalFileChecksum.Path)
+
+	if utu.LocalFileChecksum.Length > baidupcs.MaxUploadSize {
+		fmt.Printf("[%s] 文件大小超过128G, 无法上传, 跳过...\n", utu.taskInfo.Id())
+		return &taskframework.TaskUnitRunResult{
+			ResultMessage: "文件大小超过128G, 无法上传",
+			Err: fmt.Errorf(
+				"文件 %s 大小超过128G",
+				utu.LocalFileChecksum.Path,
+			),
+		}
+	}
 
 	err := utu.LocalFileChecksum.OpenPath()
 	if err != nil {
 		fmt.Printf("[%s] 文件不可读, 错误信息: %s, 跳过...\n", utu.taskInfo.Id(), err)
-		return
+		return &taskframework.TaskUnitRunResult{
+			ResultMessage: "文件不可读",
+			Err:           err,
+		}
 	}
 	defer utu.LocalFileChecksum.Close() // 关闭文件
 
@@ -332,6 +507,8 @@ func (utu *UploadTaskUnit) Run() (result *taskframework.TaskUnitRunResult) {
 		goto stepUploadRapidUpload
 	case StepUploadUpload:
 		goto stepUploadUpload
+	case JustGoon:
+		return utu.runPreparedStep()
 	}
 
 stepUploadRapidUpload:

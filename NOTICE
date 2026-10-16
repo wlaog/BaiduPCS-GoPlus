@@ -1,0 +1,13 @@
+BaiduPCS-GoPlus
+https://github.com/wlaog/BaiduPCS-GoPlus
+
+This distribution is based on qjfoidnh/BaiduPCS-Go and the BaiduPCS-Go
+work by iikira and other upstream contributors. The GitHub repository
+retains the fork lineage of felixonmars/BaiduPCS-Go.
+
+Modifications for BaiduPCS-GoPlus include manual one-way folder
+reconciliation, a local browser GUI, directory browsing, safety
+confirmations, upload initialization fixes, and release packaging.
+
+Original copyright notices and the Apache License, Version 2.0,
+are retained. See LICENSE and docs/README_UPSTREAM.md.

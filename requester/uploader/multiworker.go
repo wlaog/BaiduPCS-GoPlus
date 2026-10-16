@@ -2,9 +2,11 @@ package uploader
 
 import (
 	"context"
-	"github.com/felixonmars/BaiduPCS-Go/pcsutil/waitgroup"
+	"errors"
 	"github.com/oleiade/lane"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil/waitgroup"
 	"os"
+	"sync"
 )
 
 type (
@@ -37,25 +39,35 @@ func (werl *workerList) Readed() int64 {
 }
 
 func (muer *MultiUploader) upload() (uperr error) {
-	err := muer.multiUpload.Precreate()
+	originPCSHost, err := muer.multiUpload.Precreate()
 	if err != nil {
 		return err
 	}
-
 	var (
 		uploadDeque = lane.NewDeque()
+	)
+
+	var (
+		checksumMap = make(map[int]string) // key: wer.id, value: checksum
+		mu          sync.Mutex
 	)
 
 	// 加入队列
 	for _, wer := range muer.workers {
 		if wer.checksum == "" {
 			uploadDeque.Append(wer)
+		} else {
+			checksumMap[wer.id] = wer.checksum
 		}
 	}
 
 	for {
 		wg := waitgroup.NewWaitGroup(muer.config.Parallel)
 		for {
+			if muer.isStopped() { // 优雅停止: 不再派发新分片
+				break
+			}
+
 			e := uploadDeque.Shift()
 			if e == nil { // 任务为空
 				break
@@ -73,7 +85,7 @@ func (muer *MultiUploader) upload() (uperr error) {
 					terr        error
 				)
 				go func() {
-					checksum, terr = muer.multiUpload.TmpFile(ctx, int(wer.id), wer.partOffset, wer.splitUnit)
+					checksum, terr = muer.multiUpload.TmpFile(ctx, muer.instanceState.Uploadid, muer.targetPath, wer.id, wer.partOffset, wer.splitUnit)
 					close(doneChan)
 				}()
 				select {
@@ -85,7 +97,8 @@ func (muer *MultiUploader) upload() (uperr error) {
 				}
 				cancel()
 				if terr != nil {
-					if me, ok := terr.(*MultiError); ok {
+					var me *MultiError
+					if errors.As(terr, &me) {
 						if me.Terminated { // 终止
 							muer.closeCanceledOnce.Do(func() { // 只关闭一次
 								close(muer.canceled)
@@ -96,11 +109,17 @@ func (muer *MultiUploader) upload() (uperr error) {
 					}
 
 					uploaderVerbose.Warnf("upload err: %s, id: %d\n", terr, wer.id)
+					if muer.isStopped() { // 优雅停止: 失败的分片不再重试
+						return
+					}
 					wer.splitUnit.Seek(0, os.SEEK_SET)
 					uploadDeque.Append(wer)
 					return
 				}
 				wer.checksum = checksum
+				mu.Lock()
+				checksumMap[wer.id] = checksum // 记录成功任务的 checksum
+				mu.Unlock()
 
 				// 通知更新
 				if muer.updateInstanceStateChan != nil && len(muer.updateInstanceStateChan) < cap(muer.updateInstanceStateChan) {
@@ -109,6 +128,10 @@ func (muer *MultiUploader) upload() (uperr error) {
 			}()
 		}
 		wg.Wait()
+
+		if muer.isStopped() { // 优雅停止: 跳出外层循环
+			break
+		}
 
 		// 没有任务了
 		if uploadDeque.Size() == 0 {
@@ -125,7 +148,11 @@ func (muer *MultiUploader) upload() (uperr error) {
 	default:
 	}
 
-	cerr := muer.multiUpload.CreateSuperFile(muer.workers.CheckSumList()...)
+	if muer.isStopped() { // 优雅停止: 文件未完整上传, 不合并 superfile, 交由断点续传处理
+		return context.Canceled
+	}
+
+	cerr := muer.multiUpload.CreateSuperFile(originPCSHost, muer.config.Policy, muer.instanceState.Uploadid, muer.file.Len(), checksumMap)
 	if cerr != nil {
 		return cerr
 	}

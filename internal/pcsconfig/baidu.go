@@ -3,15 +3,16 @@ package pcsconfig
 import (
 	"errors"
 	"fmt"
-	"github.com/felixonmars/BaiduPCS-Go/baidupcs"
-	"github.com/felixonmars/BaiduPCS-Go/pcstable"
-	"github.com/felixonmars/BaiduPCS-Go/pcsutil/converter"
-	"github.com/felixonmars/baidu-tools/tieba"
-	"github.com/olekukonko/tablewriter"
 	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/olekukonko/tablewriter"
+	"github.com/qjfoidnh/BaiduPCS-Go/baidupcs"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcstable"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil/converter"
+	"github.com/qjfoidnh/baidu-tools/tieba"
 )
 
 var (
@@ -33,9 +34,14 @@ type Baidu struct {
 	Sex string  `json:"sex"` // 性别
 	Age float64 `json:"age"` // 帐号年龄
 
-	BDUSS  string `json:"bduss"`
-	PTOKEN string `json:"ptoken"`
-	STOKEN string `json:"stoken"`
+	BDUSS   string `json:"bduss"`
+	PTOKEN  string `json:"ptoken"`
+	STOKEN  string `json:"stoken"`
+	BAIDUID string `json:"baiduid"`
+	SBOXTKN string `json:"sboxtkn"`
+	COOKIES string `json:"cookies"`
+
+	AccessToken string `json:"accesstoken"`
 
 	Workdir string `json:"workdir"` // 工作目录
 }
@@ -44,10 +50,18 @@ type Baidu struct {
 func (baidu *Baidu) BaiduPCS() *baidupcs.BaiduPCS {
 	pcs := baidupcs.NewPCS(Config.AppID, baidu.BDUSS)
 	pcs.SetStoken(baidu.STOKEN)
+	if baidu.SBOXTKN != "" {
+		pcs.SetSboxtkn(baidu.SBOXTKN)
+	}
+	if strings.Contains(baidu.COOKIES, "STOKEN=") && baidu.STOKEN == "" {
+		// 未显式指定stoken则从cookies中读取
+		pcs = baidupcs.NewPCSWithCookieStr(Config.AppID, baidu.COOKIES)
+	}
 	pcs.SetHTTPS(Config.EnableHTTPS)
 	pcs.SetPCSUserAgent(Config.PCSUA)
 	pcs.SetPanUserAgent(Config.PanUA)
 	pcs.SetUID(baidu.UID)
+	pcs.SetaccessToken(baidu.AccessToken)
 	return pcs
 }
 
@@ -87,6 +101,21 @@ func NewUserInfoByBDUSS(bduss string) (b *Baidu, err error) {
 		},
 		Sex:     t.Baidu.Sex,
 		Age:     t.Baidu.Age,
+		BDUSS:   bduss,
+		Workdir: "/",
+	}
+	return b, nil
+}
+
+// NewUserInfoByInput 不检测BDUSS有效性, 手动设置百度详细信息 (只适用tieba.baidu.com用户信息接口不可用的情况)
+func NewUserInfoByInput(bduss, name string) (b *Baidu, err error) {
+	b = &Baidu{
+		BaiduBase: BaiduBase{
+			UID:  24,
+			Name: name,
+		},
+		Sex:     "default",
+		Age:     24,
 		BDUSS:   bduss,
 		Workdir: "/",
 	}

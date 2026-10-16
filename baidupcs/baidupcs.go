@@ -3,20 +3,27 @@ package baidupcs
 
 import (
 	"errors"
-	"github.com/felixonmars/BaiduPCS-Go/baidupcs/expires/cachemap"
-	"github.com/felixonmars/BaiduPCS-Go/baidupcs/internal/panhome"
-	"github.com/felixonmars/BaiduPCS-Go/baidupcs/pcserror"
-	"github.com/felixonmars/BaiduPCS-Go/pcsverbose"
-	"github.com/felixonmars/BaiduPCS-Go/requester"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
 	"strconv"
+
+	"github.com/qjfoidnh/BaiduPCS-Go/baidupcs/expires/cachemap"
+	"github.com/qjfoidnh/BaiduPCS-Go/baidupcs/internal/panhome"
+	"github.com/qjfoidnh/BaiduPCS-Go/baidupcs/pcserror"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsverbose"
+	"github.com/qjfoidnh/BaiduPCS-Go/requester"
 )
 
 const (
 	// OperationGetUK 获取UK
 	OperationGetUK = "获取UK"
+	// OperationGetBDSToken
+	OperationGetBDSToken = "获取bdstoken"
+	// OperationGetCursorDiff
+	OperationGetCursorDiff = "获取cursor后文件列表diff信息"
+	// OperationGetPCSServer 获取可用的psc服务器
+	OperationGetPCSServer = "获取可用的PCS服务器列表"
 	// OperationQuotaInfo 获取当前用户空间配额信息
 	OperationQuotaInfo = "获取当前用户空间配额信息"
 	// OperationFilesDirectoriesMeta 获取文件/目录的元信息
@@ -75,6 +82,10 @@ const (
 	OperationShareList = "列出分享列表"
 	// OperationShareSURLInfo 获取分享详细信息
 	OperationShareSURLInfo = "获取分享详细信息"
+	// OperationShareFileSavetoLocal 分享链接转存到网盘
+	OperationShareFileSavetoLocal = "分享链接转存到网盘"
+	// OperationRapidLinkSavetoLocal 秒传链接转存到网盘
+	OperationRapidLinkSavetoLocal = "秒传链接转存到网盘"
 	// OperationRecycleList 列出回收站文件列表
 	OperationRecycleList = "列出回收站文件列表"
 	// OperationRecycleRestore 还原回收站文件或目录
@@ -90,8 +101,8 @@ const (
 	OperationGetRapidUploadInfo = "获取文件秒传信息"
 	// OperationFixMD5 修复文件md5
 	OperationFixMD5 = "修复文件md5"
-	// OperrationMatchPathByShellPattern 通配符匹配文件路径
-	OperrationMatchPathByShellPattern = "通配符匹配文件路径"
+	// OperationMatchPathByShellPattern 通配符匹配文件路径
+	OperationMatchPathByShellPattern = "通配符匹配文件路径"
 
 	// PCSBaiduCom pcs api地址
 	PCSBaiduCom = "pcs.baidu.com"
@@ -102,7 +113,7 @@ const (
 	// PanAppID 百度网盘appid
 	PanAppID = "250528"
 	// NetdiskUA 网盘客户端ua
-	NetdiskUA = "netdisk;2.2.51.6;netdisk;10.0.63;PC;android-android"
+	NetdiskUA = "netdisk;P2SP;3.0.0.8;netdisk;11.12.3;ANG-AN00;android-android;10.0;JSbridge4.4.0;jointBridge;1.1.0;"
 	// DotBaiduCom .baidu.com
 	DotBaiduCom = ".baidu.com"
 	// PathSeparator 路径分隔符
@@ -114,7 +125,7 @@ var (
 
 	baiduComURL = &url.URL{
 		Scheme: "http",
-		Host:   "baidu.com",
+		Host:   "pan.baidu.com",
 	}
 
 	baiduPcsComURL = &url.URL{
@@ -126,15 +137,18 @@ var (
 type (
 	// BaiduPCS 百度 PCS API 详情
 	BaiduPCS struct {
-		appID      int                   // app_id
-		isHTTPS    bool                  // 是否启用https
-		uid        uint64                // 百度uid
-		client     *requester.HTTPClient // http 客户端
-		pcsUA      string
-		panUA      string
-		isSetPanUA bool
-		ph         *panhome.PanHome
-		cacheOpMap cachemap.CacheOpMap
+		appID       int                   // app_id
+		isHTTPS     bool                  // 是否启用https
+		uid         uint64                // 百度uid
+		client      *requester.HTTPClient // http 客户端
+		accessToken string                // accessToken
+		pcsUA       string
+		pcsAddr     string
+		panUA       string
+		isSetPanUA  bool
+		fixPCSAddr  bool
+		ph          *panhome.PanHome
+		cacheOpMap  cachemap.CacheOpMap
 	}
 
 	userInfoJSON struct {
@@ -143,7 +157,59 @@ type (
 			Uk int64 `json:"uk"`
 		} `json:"records"`
 	}
+
+	userVarJSON struct {
+		*pcserror.PanErrorInfo
+		Result struct {
+			BDSToken string `json:"bdstoken"`
+		} `json:"result"`
+	}
 )
+
+// UpdatePCSCookies 去除重名Cookies, 同名cookeis只保留最新的
+func (pcs *BaiduPCS) UpdatePCSCookies(reverse bool) {
+	cookies := pcs.GetClient().Jar.Cookies(baiduComURL)
+	new_cookies := make([]*http.Cookie, 0)
+	usedKeys := make(map[string]string)
+	if reverse {
+		for i := len(cookies) - 1; i >= 0; i-- {
+			cookie := cookies[i]
+			_, exists := usedKeys[cookie.Name]
+			if !exists {
+				new_cookies = append(new_cookies, &http.Cookie{
+					Name:   cookie.Name,
+					Value:  cookie.Value,
+					Domain: DotBaiduCom,
+				})
+				usedKeys[cookie.Name] = ""
+			}
+		}
+		for i, j := 0, len(new_cookies)-1; i < j; i, j = i+1, j-1 {
+			new_cookies[i], new_cookies[j] = new_cookies[j], new_cookies[i] //逆序
+		}
+	} else {
+		for i := 0; i < len(cookies); i++ {
+			cookie := cookies[i]
+			_, exists := usedKeys[cookie.Name]
+			if !exists {
+				new_cookies = append(new_cookies, &http.Cookie{
+					Name:   cookie.Name,
+					Value:  cookie.Value,
+					Domain: DotBaiduCom,
+				})
+				usedKeys[cookie.Name] = ""
+			}
+		}
+	}
+	client := pcs.GetClient()
+	client.ResetCookiejar()
+	// fmt.Println(len(new_cookies))
+	// for _, c := range new_cookies {
+	// 	fmt.Println(c.Value)
+	// }
+	client.Jar.SetCookies(baiduComURL, new_cookies)
+
+}
 
 // NewPCS 提供app_id, 百度BDUSS, 返回 BaiduPCS 对象
 func NewPCS(appID int, bduss string) *BaiduPCS {
@@ -223,6 +289,24 @@ func (pcs *BaiduPCS) GetBDUSS() (bduss string) {
 	return ""
 }
 
+// GetBAIDUID 获取BAIDUID
+func (pcs *BaiduPCS) GetBAIDUID() (baiduid string) {
+	if pcs.client == nil || pcs.client.Jar == nil {
+		return ""
+	}
+	cookies := pcs.client.Jar.Cookies(baiduComURL)
+	for _, cookie := range cookies {
+		if cookie.Name == "BAIDUID" {
+			return cookie.Value
+		}
+	}
+	return ""
+}
+
+func (pcs *BaiduPCS) GetPCSAddr() string {
+	return pcs.pcsAddr
+}
+
 // SetAPPID 设置app_id
 func (pcs *BaiduPCS) SetAPPID(appID int) {
 	pcs.appID = appID
@@ -232,6 +316,11 @@ func (pcs *BaiduPCS) SetAPPID(appID int) {
 // 只有locatedownload才需要设置此项
 func (pcs *BaiduPCS) SetUID(uid uint64) {
 	pcs.uid = uid
+}
+
+// SetaccessToken 设置秒传转存用的accesstoken
+func (pcs *BaiduPCS) SetaccessToken(accessToken string) {
+	pcs.accessToken = accessToken
 }
 
 // SetStoken 设置stoken
@@ -250,9 +339,49 @@ func (pcs *BaiduPCS) SetStoken(stoken string) {
 	})
 }
 
+// SetSboxtkn 设置sboxtkn
+func (pcs *BaiduPCS) SetSboxtkn(sboxtkn string) {
+	pcs.lazyInit()
+	if pcs.client.Jar == nil {
+		pcs.client.ResetCookiejar()
+	}
+
+	pcs.client.Jar.SetCookies(baiduComURL, []*http.Cookie{
+		&http.Cookie{
+			Name:   "SBOXTKN",
+			Value:  sboxtkn,
+			Domain: DotBaiduCom,
+		},
+	})
+}
+
 // SetPCSUserAgent 设置 PCS User-Agent
 func (pcs *BaiduPCS) SetPCSUserAgent(ua string) {
 	pcs.pcsUA = ua
+}
+
+// SetPCSAddr 设置 PCS 服务器地址
+func (pcs *BaiduPCS) SetPCSAddr(addr string) {
+	if addr != "" {
+		pcs.pcsAddr = addr
+	}
+}
+
+func (pcs *BaiduPCS) CopyPCS() *BaiduPCS {
+	return &BaiduPCS{
+		appID:       pcs.appID,
+		isHTTPS:     pcs.isHTTPS,
+		uid:         pcs.uid,
+		client:      pcs.client,
+		accessToken: pcs.accessToken,
+		pcsUA:       pcs.pcsUA,
+		pcsAddr:     pcs.pcsAddr,
+		panUA:       pcs.panUA,
+		isSetPanUA:  pcs.isSetPanUA,
+		fixPCSAddr:  pcs.fixPCSAddr,
+		ph:          pcs.ph,
+		cacheOpMap:  pcs.cacheOpMap,
+	}
 }
 
 // SetPanUserAgent 设置 Pan User-Agent
@@ -266,11 +395,19 @@ func (pcs *BaiduPCS) SetHTTPS(https bool) {
 	pcs.isHTTPS = https
 }
 
+func (pcs *BaiduPCS) SetStaticPCSAddr(static bool) {
+	pcs.fixPCSAddr = static
+}
+
 // URL 返回 url
 func (pcs *BaiduPCS) URL() *url.URL {
+	host := pcs.pcsAddr
+	if host == "" {
+		host = PCSBaiduCom
+	}
 	return &url.URL{
 		Scheme: GetHTTPScheme(pcs.isHTTPS),
-		Host:   PCSBaiduCom,
+		Host:   host,
 	}
 }
 
@@ -305,7 +442,6 @@ func (pcs *BaiduPCS) generatePCSURL2(subPath, method string, param ...map[string
 	}
 
 	uv := pcsURL2.Query()
-	uv.Set("app_id", PanAppID)
 	uv.Set("method", method)
 	for k := range param {
 		for k2 := range param[k] {
@@ -360,4 +496,31 @@ func (pcs *BaiduPCS) UK() (uk int64, pcsError pcserror.Error) {
 	}
 
 	return jsonData.Records[0].Uk, nil
+}
+
+func (pcs *BaiduPCS) BDSToken() (bdstoken string, pcsError pcserror.Error) {
+	dataReadCloser, pcsError := pcs.PrepareBDStoken()
+	if pcsError != nil {
+		return
+	}
+
+	defer dataReadCloser.Close()
+
+	errInfo := pcserror.NewPanErrorInfo(OperationGetBDSToken)
+	jsonData := userVarJSON{
+		PanErrorInfo: errInfo,
+	}
+
+	pcsError = pcserror.HandleJSONParse(OperationGetBDSToken, dataReadCloser, &jsonData)
+	if pcsError != nil {
+		return
+	}
+
+	if jsonData.Result.BDSToken == "" {
+		errInfo.ErrType = pcserror.ErrTypeOthers
+		errInfo.Err = errors.New("Unknown remote data")
+		return "", errInfo
+	}
+
+	return jsonData.Result.BDSToken, nil
 }

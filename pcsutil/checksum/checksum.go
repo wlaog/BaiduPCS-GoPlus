@@ -3,16 +3,20 @@ package checksum
 
 import (
 	"crypto/md5"
-	"github.com/felixonmars/BaiduPCS-Go/pcsutil/cachepool"
-	"github.com/felixonmars/BaiduPCS-Go/pcsutil/converter"
+	"encoding/hex"
+	"fmt"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil/cachepool"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil/converter"
 	"hash/crc32"
 	"io"
 	"os"
+	"runtime"
+	"sync"
 )
 
 const (
 	// DefaultBufSize 默认的bufSize
-	DefaultBufSize = int(256 * converter.KB)
+	DefaultBufSize = int(1 * converter.MB)
 )
 
 const (
@@ -27,12 +31,13 @@ const (
 type (
 	// LocalFileMeta 本地文件元信息
 	LocalFileMeta struct {
-		Path     string `json:"path"`     // 本地路径
-		Length   int64  `json:"length"`   // 文件大小
-		SliceMD5 []byte `json:"slicemd5"` // 文件前 requiredSliceLen (256KB) 切片的 md5 值
-		MD5      []byte `json:"md5"`      // 文件的 md5
-		CRC32    uint32 `json:"crc32"`    // 文件的 crc32
-		ModTime  int64  `json:"modtime"`  // 修改日期
+		Path       string   `json:"path"`      // 本地路径
+		Length     int64    `json:"length"`    // 文件大小
+		SliceMD5   []byte   `json:"slicemd5"`  // 文件前 requiredSliceLen (256KB) 切片的 md5 值
+		BlocksList []string `json:"blocklist"` // 文件分块计算md5的切片
+		MD5        []byte   `json:"md5"`       // 文件的 md5
+		CRC32      uint32   `json:"crc32"`     // 文件的 crc32
+		ModTime    int64    `json:"modtime"`   // 修改日期
 	}
 
 	// LocalFileChecksum 校验本地文件
@@ -118,6 +123,17 @@ func (lfc *LocalFileChecksum) writeChecksum(data []byte, wus ...*ChecksumWriteUn
 		return ErrChecksumWriteAllStop
 	}
 	return nil
+}
+
+func (lfc *LocalFileChecksum) GetSliceDataContent(offset, length int64) (dataContent []byte, readLength int64, err error) {
+	dataContent = make([]byte, length)
+	ret, err := lfc.file.ReadAt(dataContent, offset)
+	if err != nil && err != io.EOF {
+		return
+	}
+	readLength = int64(ret)
+	dataContent = dataContent[:ret]
+	return dataContent, readLength, nil
 }
 
 func (lfc *LocalFileChecksum) repeatRead(wus ...*ChecksumWriteUnit) (err error) {
@@ -219,6 +235,90 @@ func (lfc *LocalFileChecksum) Sum(checkSumFlag int) (err error) {
 
 	err = lfc.repeatRead(wus...)
 	return
+}
+
+// CalculateChunkedSum 按指定大小分块并行计算MD5
+func (lfc *LocalFileChecksum) CalculateChunkedSum(chunkSize int64) (err error) {
+
+	// 确保分块大小有效
+	if chunkSize <= 0 {
+		return fmt.Errorf("invalid block size: %d", chunkSize)
+	}
+
+	fileSize := lfc.Length
+	if fileSize == 0 {
+		return nil // 空文件
+	}
+
+	// 计算分块数量
+	chunkCount := int((fileSize + chunkSize - 1) / chunkSize)
+
+	// 初始化结果存储, 各 worker 按自己的块索引写入, 无需加锁
+	lfc.BlocksList = make([]string, chunkCount)
+
+	// worker 数: 不超过逻辑核数, 不超过分块数, 上限 16 (控制 4MB×N 的缓冲区内存)
+	workers := runtime.GOMAXPROCS(0)
+	if workers > 16 {
+		workers = 16
+	}
+	if workers > chunkCount {
+		workers = chunkCount
+	}
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, workers)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(workerId int) {
+			defer wg.Done()
+
+			buffer := make([]byte, 4*converter.MB) // 每个 worker 独享缓冲区, 不可共享
+			chunkMD5 := md5.New()
+
+			for i := workerId; i < chunkCount; i += workers {
+				offset := int64(i) * chunkSize
+				// 计算当前分块的实际大小（最后一块可能较小）
+				currentChunkSize := chunkSize
+				if offset+chunkSize > fileSize {
+					currentChunkSize = fileSize - offset
+				}
+
+				chunkMD5.Reset()
+				bytesRead := int64(0)
+
+				// 读取当前分块的所有数据
+				for bytesRead < currentChunkSize {
+					readSize := int64(len(buffer))
+					if readSize > currentChunkSize-bytesRead {
+						readSize = currentChunkSize - bytesRead
+					}
+
+					n, rerr := lfc.file.ReadAt(buffer[:readSize], offset+bytesRead)
+					if n > 0 {
+						chunkMD5.Write(buffer[:n])
+						bytesRead += int64(n)
+					}
+					if rerr != nil && rerr != io.EOF {
+						select {
+						case errCh <- rerr:
+						default:
+						}
+						return
+					}
+				}
+
+				lfc.BlocksList[i] = hex.EncodeToString(chunkMD5.Sum(nil))
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	select {
+	case err = <-errCh:
+		return err
+	default:
+	}
+	return nil
 }
 
 func (lfc *LocalFileChecksum) fix() {

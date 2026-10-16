@@ -5,7 +5,7 @@ package multipartreader
 import (
 	"errors"
 	"fmt"
-	"github.com/felixonmars/BaiduPCS-Go/requester/rio"
+	"github.com/qjfoidnh/BaiduPCS-Go/requester/rio"
 	"io"
 	"mime/multipart"
 	"strings"
@@ -55,8 +55,8 @@ func NewMultipartReader() (mr *MultipartReader) {
 	return
 }
 
-// AddFormFeild 增加 form 表单
-func (mr *MultipartReader) AddFormFeild(fieldname string, readerlen rio.ReaderLen) {
+// AddFormField 增加 form 表单
+func (mr *MultipartReader) AddFormField(fieldname string, readerlen rio.ReaderLen) {
 	if readerlen == nil {
 		return
 	}

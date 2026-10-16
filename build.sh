@@ -4,20 +4,18 @@ name="BaiduPCS-Go"
 version=$1
 
 if [ "$1" = "" ]; then
-  version=v3.6.2
+  version=v3.7.1
 fi
 
-output="out/"
-
-GOROOT=/usr
+output="out"
 
 old_golang() {
-  #GOROOT=/usr/local/go1.10.8
+  GOROOT=/usr/local/go
   go=$GOROOT/bin/go
 }
 
 new_golang() {
-  #GOROOT=/usr/local/go
+  GOROOT=/usr/local/go
   go=$GOROOT/bin/go
 }
 
@@ -31,8 +29,9 @@ Build() {
   echo "Building $1..."
   export GOOS=$2 GOARCH=$3 GO386=sse2 CGO_ENABLED=0 GOARM=$4
   if [ $2 = "windows" ]; then
-    goversioninfo -o=resource_windows_386.syso
-    goversioninfo -64 -o=resource_windows_amd64.syso
+    if command -v goversioninfo >/dev/null 2>&1; then
+      goversioninfo -platform-specific
+    fi
     $go build -ldflags "-X main.Version=$version -s -w" -o "$output/$1/$name.exe"
     RicePack $1 $name.exe
   else
@@ -59,10 +58,10 @@ IOSBuild() {
   mkdir -p "$output/$1"
   cd "$output/$1"
   export CC=/usr/local/go/misc/ios/clangwrap.sh GOOS=darwin GOARCH=arm GOARM=7 CGO_ENABLED=1
-  $go build -ldflags "-X main.Version=$version -s -w" -o "armv7" github.com/felixonmars/BaiduPCS-Go
+  $go build -ldflags "-X main.Version=$version -s -w" -o "armv7" github.com/qjfoidnh/BaiduPCS-Go
   jtool --sign --inplace --ent ../../entitlements.xml "armv7"
   export GOARCH=arm64
-  $go build -ldflags "-X main.Version=$version -s -w" -o "arm64" github.com/felixonmars/BaiduPCS-Go
+  $go build -ldflags "-X main.Version=$version -s -w" -o "arm64" github.com/qjfoidnh/BaiduPCS-Go
   jtool --sign --inplace --ent ../../entitlements.xml "arm64"
   lipo -create "armv7" "arm64" -output $name # merge
   rm "armv7" "arm64"
@@ -87,13 +86,11 @@ Pack() {
 # rice 打包静态资源
 RicePack() {
   return # 已取消web功能
-  rice -i github.com/felixonmars/BaiduPCS-Go/internal/pcsweb append --exec "$output/$1/$2"
+  rice -i github.com/qjfoidnh/BaiduPCS-Go/internal/pcsweb append --exec "$output/$1/$2"
 }
 
-touch ./vendor/golang.org/x/sys/windows/windows.s
-
 # Android
-export NDK_INSTALL=$ANDROID_NDK_ROOT/bin
+#export NDK_INSTALL=$ANDROID_NDK_ROOT/bin
 # CC=$NDK_INSTALL/arm-linux-androideabi-4.9/bin/arm-linux-androideabi-gcc AndroidBuild $name-$version"-android-16-armv5" android arm 5
 # CC=$NDK_INSTALL/arm-linux-androideabi-4.9/bin/arm-linux-androideabi-gcc AndroidBuild $name-$version"-android-16-armv6" android arm 6
 #CC=$NDK_INSTALL/arm-linux-androideabi-4.9/bin/arm-linux-androideabi-gcc AndroidBuild $name-$version"-android-16-armv7" android arm 7
@@ -102,21 +99,23 @@ export NDK_INSTALL=$ANDROID_NDK_ROOT/bin
 #CC=$NDK_INSTALL/x86_64-linux-android-4.9/bin/x86_64-linux-android-gcc AndroidBuild $name-$version"-android-21-amd64" android amd64 7
 
 # iOS
-IOSBuild $name-$version"-darwin-ios-arm"
+#IOSBuild $name-$version"-darwin-ios-arm"
 
 # OS X / macOS
 Build $name-$version"-darwin-osx-amd64" darwin amd64
+Build $name-$version"-darwin-osx-arm64" darwin arm64
 # Build $name-$version"-darwin-osx-386" darwin 386
 
 # Windows
 Build $name-$version"-windows-x86" windows 386
 Build $name-$version"-windows-x64" windows amd64
+Build $name-$version"-windows-arm64" windows arm64
 
 # Linux
 Build $name-$version"-linux-386" linux 386
 Build $name-$version"-linux-amd64" linux amd64
-Build $name-$version"-linux-armv5" linux arm 5
-Build $name-$version"-linux-armv7" linux arm 7
+#Build $name-$version"-linux-armv5" linux arm 5
+Build $name-$version"-linux-arm" linux arm
 Build $name-$version"-linux-arm64" linux arm64
 GOMIPS=softfloat Build $name-$version"-linux-mips" linux mips
 Build $name-$version"-linux-mips64" linux mips64

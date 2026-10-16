@@ -2,8 +2,8 @@ package cachemap_test
 
 import (
 	"fmt"
-	"github.com/felixonmars/BaiduPCS-Go/baidupcs/expires"
-	"github.com/felixonmars/BaiduPCS-Go/baidupcs/expires/cachemap"
+	"github.com/qjfoidnh/BaiduPCS-Go/baidupcs/expires"
+	"github.com/qjfoidnh/BaiduPCS-Go/baidupcs/expires/cachemap"
 	"sync"
 	"sync/atomic"
 	"testing"

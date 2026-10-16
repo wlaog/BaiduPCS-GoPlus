@@ -2,11 +2,12 @@ package uploader
 
 import (
 	"context"
-	"github.com/felixonmars/BaiduPCS-Go/pcsutil"
-	"github.com/felixonmars/BaiduPCS-Go/pcsutil/converter"
-	"github.com/felixonmars/BaiduPCS-Go/requester"
-	"github.com/felixonmars/BaiduPCS-Go/requester/rio"
-	"github.com/felixonmars/BaiduPCS-Go/requester/rio/speeds"
+	"github.com/qjfoidnh/BaiduPCS-Go/baidupcs/pcserror"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil"
+	"github.com/qjfoidnh/BaiduPCS-Go/pcsutil/converter"
+	"github.com/qjfoidnh/BaiduPCS-Go/requester"
+	"github.com/qjfoidnh/BaiduPCS-Go/requester/rio"
+	"github.com/qjfoidnh/BaiduPCS-Go/requester/rio/speeds"
 	"sync"
 	"time"
 )
@@ -14,9 +15,9 @@ import (
 type (
 	// MultiUpload 支持多线程的上传, 可用于断点续传
 	MultiUpload interface {
-		Precreate() (perr error)
-		TmpFile(ctx context.Context, partseq int, partOffset int64, readerlen64 rio.ReaderLen64) (checksum string, terr error)
-		CreateSuperFile(checksumList ...string) (cerr error)
+		Precreate() (pcsHost string, err pcserror.Error)
+		TmpFile(ctx context.Context, uploadid, targetPath string, partseq int, partOffset int64, readerlen64 rio.ReaderLen64) (checksum string, terr error)
+		CreateSuperFile(pcsHost, policy, uploadId string, fileSize int64, checksumMap map[int]string) (cerr error)
 	}
 
 	// MultiUploader 多线程上传
@@ -36,28 +37,38 @@ type (
 		workers     workerList
 		speedsStat  *speeds.Speeds
 		rateLimit   *speeds.RateLimit
+		targetPath  string
 
 		executeTime             time.Time
 		finished                chan struct{}
 		canceled                chan struct{}
 		closeCanceledOnce       sync.Once
+		stopped                 chan struct{} // 优雅停止信号: 不再派发新分片, 进行中的分片继续完成
+		stopOnce                sync.Once
 		updateInstanceStateChan chan struct{}
 	}
 
 	// MultiUploaderConfig 多线程上传配置
 	MultiUploaderConfig struct {
-		Parallel  int   // 上传并发量
-		BlockSize int64 // 上传分块
-		MaxRate   int64 // 限制最大上传速度
+		Parallel  int    // 上传并发量
+		BlockSize int64  // 上传分块
+		MaxRate   int64  // 限制最大上传速度
+		Policy    string // 文件重名策略
 	}
 )
 
 // NewMultiUploader 初始化上传
-func NewMultiUploader(multiUpload MultiUpload, file rio.ReaderAtLen64, config *MultiUploaderConfig) *MultiUploader {
+func NewMultiUploader(multiUpload MultiUpload, file rio.ReaderAtLen64, config *MultiUploaderConfig, targetPath string) *MultiUploader {
 	return &MultiUploader{
 		multiUpload: multiUpload,
 		file:        file,
 		config:      config,
+		targetPath:  targetPath,
+
+		finished:                make(chan struct{}, 1),
+		canceled:                make(chan struct{}),
+		stopped:                 make(chan struct{}),
+		updateInstanceStateChan: make(chan struct{}, 1),
 	}
 }
 
@@ -73,6 +84,9 @@ func (muer *MultiUploader) lazyInit() {
 	if muer.canceled == nil {
 		muer.canceled = make(chan struct{})
 	}
+	if muer.stopped == nil {
+		muer.stopped = make(chan struct{})
+	}
 	if muer.updateInstanceStateChan == nil {
 		muer.updateInstanceStateChan = make(chan struct{}, 1)
 	}
@@ -83,7 +97,7 @@ func (muer *MultiUploader) lazyInit() {
 		muer.config.Parallel = 4
 	}
 	if muer.config.BlockSize <= 0 {
-		muer.config.BlockSize = 1 * converter.GB
+		muer.config.BlockSize = 16 * converter.MB
 	}
 	if muer.speedsStat == nil {
 		muer.speedsStat = &speeds.Speeds{}
@@ -103,7 +117,6 @@ func (muer *MultiUploader) check() {
 func (muer *MultiUploader) Execute() {
 	muer.check()
 	muer.lazyInit()
-
 	// 初始化限速
 	if muer.config.MaxRate > 0 {
 		muer.rateLimit = speeds.NewRateLimit(muer.config.MaxRate)
@@ -111,7 +124,7 @@ func (muer *MultiUploader) Execute() {
 	}
 
 	// 分配任务
-	if muer.instanceState != nil {
+	if muer.instanceState != nil && len(muer.instanceState.BlockList) > 0 {
 		muer.workers = muer.getWorkerListByInstanceState(muer.instanceState)
 		uploaderVerbose.Infof("upload task CREATED from instance state\n")
 	} else {
@@ -158,40 +171,60 @@ func (muer *MultiUploader) InstanceState() *InstanceState {
 	}
 	return &InstanceState{
 		BlockList: blockStates,
+		Uploadid:  muer.instanceState.Uploadid,
 	}
 }
 
 // Cancel 取消上传
 func (muer *MultiUploader) Cancel() {
-	close(muer.canceled)
+	muer.closeCanceledOnce.Do(func() {
+		close(muer.canceled)
+	})
 }
 
-//OnExecute 设置开始上传事件
+// GracefulStop 优雅停止: 不再派发新分片, 进行中的分片继续执行直至完成
+func (muer *MultiUploader) GracefulStop() {
+	muer.stopOnce.Do(func() {
+		close(muer.stopped)
+	})
+}
+
+// isStopped 返回是否已请求优雅停止
+func (muer *MultiUploader) isStopped() bool {
+	select {
+	case <-muer.stopped:
+		return true
+	default:
+		return false
+	}
+}
+
+// OnExecute 设置开始上传事件
 func (muer *MultiUploader) OnExecute(onExecuteEvent requester.Event) {
 	muer.onExecuteEvent = onExecuteEvent
 }
 
-//OnSuccess 设置成功上传事件
+// OnSuccess 设置成功上传事件
 func (muer *MultiUploader) OnSuccess(onSuccessEvent requester.Event) {
 	muer.onSuccessEvent = onSuccessEvent
 }
 
-//OnFinish 设置结束上传事件
+// OnFinish 设置结束上传事件
 func (muer *MultiUploader) OnFinish(onFinishEvent requester.Event) {
 	muer.onFinishEvent = onFinishEvent
 }
 
-//OnCancel 设置取消上传事件
+// OnCancel 设置取消上传事件
 func (muer *MultiUploader) OnCancel(onCancelEvent requester.Event) {
 	muer.onCancelEvent = onCancelEvent
 }
 
-//OnError 设置上传发生错误事件
+// OnError 设置上传发生错误事件
 func (muer *MultiUploader) OnError(onErrorEvent requester.EventOnError) {
 	muer.onErrorEvent = onErrorEvent
 }
 
-//OnUploadStatusEvent 设置上传状态事件
+// OnUploadStatusEvent 设置上传状态事件
 func (muer *MultiUploader) OnUploadStatusEvent(f UploadStatusFunc) {
 	muer.onUploadStatusEvent = f
 }
