@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"os"
 	"runtime/debug"
-	"strings"
 	"sync"
 	"time"
 
@@ -22,8 +21,6 @@ import (
 type GuiOptions struct {
 	// Addr is the listen address. Empty means 127.0.0.1 on an ephemeral port.
 	Addr string
-	// OpenBrowser launches the default browser at the tokenised URL.
-	OpenBrowser bool
 	// LocalDir and RemoteRoot pre-fill the form.
 	LocalDir   string
 	RemoteRoot string
@@ -57,16 +54,13 @@ type guiProgress struct {
 }
 
 // guiVersion identifies the front-end in reports and in the page footer.
-const guiVersion = "0.4.1"
+const guiVersion = "0.4.2"
 
 // RunReconcileGui starts the local interface and blocks until the process is
 // interrupted or the page asks it to shut down.
 func RunReconcileGui(opt *GuiOptions) error {
 	if opt == nil {
 		opt = &GuiOptions{}
-	}
-	if !opt.OpenBrowser && !isFlagPassed("no-browser") {
-		opt.OpenBrowser = true
 	}
 	if opt.Addr == "" {
 		opt.Addr = "127.0.0.1:0"
@@ -99,6 +93,7 @@ func RunReconcileGui(opt *GuiOptions) error {
 	mux.HandleFunc("/api/state", session.protected(session.handleState))
 	mux.HandleFunc("/api/probe", session.protected(session.operation(session.handleProbe)))
 	mux.HandleFunc("/api/plan", session.protected(session.operation(session.handlePlan)))
+	mux.HandleFunc("/api/rescan", session.protected(session.operation(session.handleRescan)))
 	mux.HandleFunc("/api/apply", session.protected(session.operation(session.handleApply)))
 	mux.HandleFunc("/api/log", session.protected(session.handleLog))
 	mux.HandleFunc("/api/browse", session.protected(session.operation(session.handleBrowse)))
@@ -109,16 +104,12 @@ func RunReconcileGui(opt *GuiOptions) error {
 
 	fmt.Printf("对齐本地 · 图形界面已启动\n")
 	fmt.Printf("  地址: %s\n", url)
+	fmt.Printf("  请复制上面的完整地址（包含 token）到浏览器中手动打开。\n")
 	fmt.Printf("  说明: 只监听本机, 每次访问都需要令牌; 关闭本窗口或按 Ctrl+C 结束\n")
 	fmt.Printf("  本界面只驱动 reconcile 的 探测/预览/执行 三个操作, 不替代官方客户端。\n\n")
 
 	quit := make(chan struct{})
 	session.quit = quit
-	if opt.OpenBrowser {
-		if err := openBrowser(url); err != nil {
-			fmt.Printf("未能自动打开浏览器 (%v), 请手动访问上面的地址。\n", err)
-		}
-	}
 
 	go func() {
 		<-quit
@@ -177,7 +168,7 @@ func (s *GuiSession) operation(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		defer s.workMu.Unlock()
-		tracked := r.URL.Path == "/api/plan" || r.URL.Path == "/api/probe" || r.URL.Path == "/api/apply"
+		tracked := r.URL.Path == "/api/plan" || r.URL.Path == "/api/rescan" || r.URL.Path == "/api/probe" || r.URL.Path == "/api/apply"
 		if tracked {
 			s.mu.Lock()
 			s.progress = guiProgress{Running: true, Status: "running", StartedAt: time.Now().UnixMilli(), Progress: reconcile.Progress{Phase: "starting"}}
@@ -369,6 +360,31 @@ func (s *GuiSession) handlePlan(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, map[string]interface{}{"ok": true, "report": report, "savedTo": path})
 }
 
+func (s *GuiSession) handleRescan(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	previous := s.plan
+	s.mu.Unlock()
+	sess := &ReconcileSession{Observer: s.appendLog, Progress: s.observeProgress}
+	plan, err := sess.RetryScan(previous)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	report := reconcile.BuildPlanReport(plan, "仅补扫失败范围（复用成功扫描）")
+	s.mu.Lock()
+	s.plan, s.report = plan, report
+	if len(plan.ScanIssues) > 0 {
+		s.progress.Status = "warning"
+	}
+	s.mu.Unlock()
+	file, saveErr := SavePlanReport(report)
+	if saveErr != nil {
+		s.appendLog("报告保存失败: " + saveErr.Error())
+	}
+	s.appendLog(fmt.Sprintf("补扫完成：仍未核实 %d 个范围，可独立整理 %d 项", len(plan.ScanIssues), plan.Changes()))
+	s.writeJSON(w, map[string]interface{}{"ok": true, "report": report, "savedTo": file})
+}
+
 func (s *GuiSession) handleApply(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		RemovalMode        string  `json:"removalMode"`
@@ -448,18 +464,8 @@ func (s *GuiSession) finishApply(plan *reconcile.Plan, report *reconcile.ApplyRe
 	defer s.mu.Unlock()
 	s.plan = remaining
 	s.report = preview
-	if !report.Succeeded() {
+	if !report.Succeeded() || len(plan.ScanIssues) > 0 {
 		s.progress.Status = "warning"
 	}
 	return preview
-}
-
-// isFlagPassed reports whether a CLI flag is present in os.Args.
-func isFlagPassed(name string) bool {
-	for _, a := range os.Args[1:] {
-		if strings.TrimLeft(a, "-") == name || strings.HasPrefix(a, "--"+name+"=") || strings.HasPrefix(a, "-"+name+"=") {
-			return true
-		}
-	}
-	return false
 }

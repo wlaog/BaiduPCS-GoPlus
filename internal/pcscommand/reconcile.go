@@ -210,7 +210,7 @@ func RunReconcileApply(opt *ReconcileApplyOptions) error {
 	preview := reconcile.BuildPlanReport(plan, "apply (执行前预览)")
 	reconcile.RenderPlanHuman(os.Stdout, preview)
 
-	if !plan.ScanComplete || !plan.LocalScanComplete {
+	if !plan.CanApply() {
 		return errors.New("扫描不完整, 已拒绝执行 (不会做任何改动)")
 	}
 	if plan.Changes() == 0 {

@@ -20,6 +20,9 @@ type ScanLimits struct {
 	// PruneDir deliberately treats selected directories as opaque units. Only
 	// cleanup planning uses this; probes still enumerate the entire tree.
 	PruneDir func(RemoteEntry) bool
+	// ContinueOnError keeps successful scopes when authentication fails in a
+	// subtree. Read-only probes retain their original fail-fast semantics.
+	ContinueOnError bool
 	// MaxEntries caps the total number of entries recorded. Zero means the
 	// default (200000).
 	MaxEntries int
@@ -79,8 +82,8 @@ type ScanStats struct {
 	// LargeDirs lists directories spanning at least one full page (1000).
 	// This is informational; the adapter returns pagination faults as errors.
 	LargeDirs map[string]int
-	// Errors records subtrees that could not be enumerated. Any entry here is
-	// fatal for planning: an unreadable subtree must never look "empty".
+	// Errors records protected gaps. Cleanup may apply independently verified
+	// siblings; probes still require a complete enumeration for a PASS verdict.
 	Errors []ScanError
 	// DepthBounded lists directories where enumeration stopped because the
 	// caller asked for a shallower scan. This bounds the report without making
@@ -304,15 +307,14 @@ func ScanCloud(r Reader, root string, limits ScanLimits) (*CloudScan, error) {
 			// every subsequent listing would fail too. Continuing would record
 			// the rest of the tree as effectively empty, which the planner would
 			// then read as "everything below is locally deleted". Abort instead.
-			if IsAuthError(listErr) {
+			if IsAuthError(listErr) && !limits.ContinueOnError {
 				scan.Stats.Errors = append(scan.Stats.Errors, ScanError{Path: cur.path, Err: listErr.Error()})
 				scan.Stats.AuthFailed = true
 				scan.Stats.AuthError = listErr.Error()
 				return scan, &AuthExpiredError{Cause: listErr, At: cur.path}
 			}
-			// Record and continue: a sibling subtree may still be scannable,
-			// and the caller blocks any destructive step when Errors is
-			// non-empty.
+			// Retain a scoped gap; cleanup protects this branch and can still
+			// compare or apply independently verified siblings.
 			scan.Stats.Errors = append(scan.Stats.Errors, ScanError{Path: cur.path, Err: listErr.Error()})
 			continue
 		}

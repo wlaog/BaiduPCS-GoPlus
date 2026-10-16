@@ -12,7 +12,7 @@ setlocal
 ::
 ::  It does two things:
 ::    1. point the config dir at .pcsconfig (the saved login)
-::    2. start "reconcile gui", which opens the browser
+::    2. start "reconcile gui" and print the address for manual access
 ::
 ::  Close this window to stop the interface.
 ::  Nothing on the cloud is changed by starting or closing it.
@@ -34,15 +34,14 @@ echo ============================================================
 echo   exe    : %EXE%
 echo   config : %CFG%
 echo.
-echo   The browser should open automatically. If it does not,
-echo   open the http address printed below.
+echo   Copy the full http address printed below into your browser.
 echo.
 echo   Close this window, or use the page's own close button,
 echo   to stop the interface.
 echo ============================================================
 echo.
 
-"%EXE%" reconcile gui
+"%EXE%" reconcile gui --no-browser
 set "RC=%ERRORLEVEL%"
 
 echo.

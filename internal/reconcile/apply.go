@@ -39,6 +39,7 @@ type ApplyResult struct {
 	// old version has already left the target path.
 	TargetRemoved  bool
 	DeferredSource bool
+	verifiedTarget *RemoteEntry
 	Detail, Error  string
 }
 
@@ -46,6 +47,7 @@ type ApplyReport struct {
 	ApplyVersion, StartedAt, FinishedAt, LocalRoot, RemoteRoot, RemovalMode string
 	Renames, Removes                                                        []ApplyResult
 	Failures, PendingCount, ConflictCount                                   int
+	UnverifiedCount                                                         int
 	RemovalSkipped                                                          bool
 	RemovalReason                                                           string
 	Aborted                                                                 bool
@@ -116,8 +118,9 @@ func (e *Executor) Apply(plan *Plan, opt ApplyOptions) (rep *ApplyReport, err er
 		return nil, fmt.Errorf("当前仅使用网盘回收站，不创建隔离目录")
 	}
 	rep = &ApplyReport{ApplyVersion: ApplyVersion, StartedAt: e.now().Format(time.RFC3339), LocalRoot: plan.LocalRoot, RemoteRoot: plan.RemoteRoot, RemovalMode: string(RemovalRecycle), PendingCount: len(plan.Pending), ConflictCount: len(plan.Conflicts)}
+	rep.UnverifiedCount = len(plan.ScanIssues)
 	defer func() { rep.FinishedAt = e.now().Format(time.RFC3339) }()
-	if !plan.ScanComplete || !plan.LocalScanComplete || len(plan.ScanErrors) > 0 {
+	if !plan.CanApply() {
 		rep.Aborted = true
 		rep.AbortReason = "扫描不完整，拒绝执行"
 		return rep, fmt.Errorf("%w: %s", ErrUsage, rep.AbortReason)
@@ -199,6 +202,10 @@ func asyncPending() error {
 
 func (e *Executor) executeItem(plan *Plan, a PlannedAction, phase string) (res ApplyResult) {
 	res = ApplyResult{Action: a, Phase: phase}
+	if plan.actionUnverified(a) {
+		res.Skipped, res.Error = true, "此项涉及未核实的扫描范围，已保护；其他独立项继续"
+		return res
+	}
 	defer func() {
 		if recover() != nil {
 			res.OK = false
@@ -268,6 +275,7 @@ func (e *Executor) renameOne(plan *Plan, res *ApplyResult) error {
 		return serr
 	}
 	if terr == nil && matchesHash(target, a.Hash, a.LocalSize) {
+		res.verifiedTarget = &target
 		if IsNotFound(serr) {
 			res.Detail = "目标已是本地版本，来源已移走，确认完成"
 			return nil
@@ -337,6 +345,7 @@ func (e *Executor) renameOne(plan *Plan, res *ApplyResult) error {
 	if !matchesHash(target, a.Hash, a.LocalSize) {
 		return changed("重命名后的目标内容不一致，保留关联历史副本")
 	}
+	res.verifiedTarget = &target
 	_, serr = e.Writer.Meta(a.SourcePath)
 	if serr == nil {
 		return asyncPending()
@@ -464,8 +473,27 @@ func RemainingPlan(plan *Plan, rep *ApplyReport) *Plan {
 	for p, e := range plan.cloudSnapshot {
 		remaining.cloudSnapshot[p] = e
 	}
+	// Keep the retained scan consistent with successful mutations, so a later
+	// failed-scope rescan cannot reintroduce already completed operations.
+	for _, res := range rep.Removes {
+		if res.OK {
+			removeRemoteScope(remaining.cloudSnapshot, res.Action.RemotePath)
+		}
+	}
 	for _, res := range rep.Renames {
-		if res.TargetRemoved {
+		if res.verifiedTarget != nil {
+			remaining.cloudSnapshot[res.Action.RemotePath] = *res.verifiedTarget
+		}
+		if res.OK {
+			if source, ok := remaining.cloudSnapshot[res.Action.SourcePath]; ok {
+				delete(remaining.cloudSnapshot, res.Action.SourcePath)
+				if res.verifiedTarget == nil {
+					source.Path, source.Name = res.Action.RemotePath, path.Base(res.Action.RemotePath)
+					remaining.cloudSnapshot[source.Path] = source
+				}
+			}
+		}
+		if res.TargetRemoved && !res.OK && res.verifiedTarget == nil {
 			delete(remaining.cloudSnapshot, res.Action.RemotePath)
 		}
 		if res.DeferredSource {
@@ -490,7 +518,7 @@ func RemainingPlan(plan *Plan, rep *ApplyReport) *Plan {
 		remaining.Renames = append([]PlannedAction(nil), plan.Renames...)
 		remaining.Removes = append([]PlannedAction(nil), plan.Removes...)
 	}
-	if remaining.Changes() == 0 {
+	if remaining.Changes() == 0 && len(remaining.ScanIssues) == 0 {
 		return nil
 	}
 	return &remaining
@@ -498,4 +526,4 @@ func RemainingPlan(plan *Plan, rep *ApplyReport) *Plan {
 
 func ParentRemote(p string) string { p = NormalizeRemoteRoot(p); return path.Dir(p) }
 
-const ApplyVersion = "0.4.1"
+const ApplyVersion = "0.4.2"

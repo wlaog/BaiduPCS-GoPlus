@@ -16,8 +16,9 @@ import (
 type ActionKind string
 
 const (
-	ActionRename  ActionKind = "RENAME"
-	ActionPending ActionKind = "WAIT"
+	ActionRename     ActionKind = "RENAME"
+	ActionPending    ActionKind = "WAIT"
+	ActionUnverified ActionKind = "UNVERIFIED"
 	// ActionUpload means the path exists locally but not on the cloud.
 	ActionUpload ActionKind = "UPLOAD"
 	// ActionReplace means the path exists on both sides but the cloud copy is
@@ -135,6 +136,10 @@ func (o PlanOptions) withDefaults() PlanOptions {
 type Plan struct {
 	Performance   PlanPerformance
 	cloudSnapshot map[string]RemoteEntry
+	localSnapshot *LocalScanResult
+	cloudScan     *CloudScan
+	planOptions   PlanOptions
+	hashSnapshot  map[string]hashResult
 	GeneratedAt   string
 	LocalRoot     string
 	RemoteRoot    string
@@ -146,14 +151,17 @@ type Plan struct {
 	// to reject incompatible full-mirror plans. New plans leave them empty.
 	UploadDirCount int
 
-	Uploads   []PlannedAction
-	Replaces  []PlannedAction
-	Mkdirs    []PlannedAction
-	Removes   []PlannedAction
-	Keeps     []PlannedAction
-	Conflicts []PlannedAction
-	Renames   []PlannedAction
-	Pending   []PlannedAction
+	Uploads         []PlannedAction
+	Replaces        []PlannedAction
+	Mkdirs          []PlannedAction
+	Removes         []PlannedAction
+	Keeps           []PlannedAction
+	Conflicts       []PlannedAction
+	Renames         []PlannedAction
+	Pending         []PlannedAction
+	Unverified      []PlannedAction
+	ScanIssues      []ScanIssue
+	PartialScanSafe bool
 
 	// LocalFiles, LocalDirs, CloudFiles, CloudDirs describe the inputs.
 	LocalFiles int
@@ -164,8 +172,8 @@ type Plan struct {
 	LocalBytes int64
 	CloudBytes int64
 
-	// ScanComplete is false when the cloud enumeration had gaps. A plan from an
-	// incomplete scan must never be applied.
+	// ScanComplete reports full coverage, independently of whether scoped gaps
+	// were safely isolated. Execution uses CanApply and per-action guards.
 	ScanComplete bool
 	// LocalScanComplete is false when the local walk hit its entry cap.
 	LocalScanComplete bool
@@ -193,7 +201,7 @@ func (p *Plan) Changes() int {
 
 // ZeroDifference reports whether the cloud already matches the local tree.
 func (p *Plan) ZeroDifference() bool {
-	return p.Changes() == 0 && len(p.Pending) == 0 && len(p.Conflicts) == 0
+	return p.Changes() == 0 && len(p.Pending) == 0 && len(p.Conflicts) == 0 && len(p.ScanIssues) == 0
 }
 
 // HasConflicts reports whether any path needs human judgement.
@@ -276,9 +284,26 @@ func BuildPlan(r Reader, opt PlanOptions) (*Plan, error) {
 	if err != nil {
 		return nil, err
 	}
-	opt.Limits.Progress = opt.Progress
-	opt.Limits.PruneDir = func(ce RemoteEntry) bool {
+	opt.Limits = cleanupScanLimits(local, opt)
+	scan, err := ScanCloud(r, root, opt.Limits)
+	if err != nil {
+		return nil, err
+	}
+	return assemblePlan(local, scan, opt, nil), nil
+}
+
+func cleanupScanLimits(local *LocalScanResult, opt PlanOptions) ScanLimits {
+	root := NormalizeRemoteRoot(opt.RemoteRoot)
+	limits := opt.Limits
+	limits.Progress = opt.Progress
+	limits.ContinueOnError = true
+	limits.PruneDir = func(ce RemoteEntry) bool {
 		rel := RelPath(root, ce.Path)
+		for _, issue := range local.Errors {
+			if relOverlaps(rel, issue.Path) {
+				return false
+			}
+		}
 		// Excluded paths and ambiguous local ancestors stay protected. For a
 		// genuinely absent folder, child-level exclusions do not retain shells.
 		for ancestor := rel; ancestor != ""; ancestor = ParentRel(ancestor) {
@@ -292,16 +317,26 @@ func BuildPlan(r Reader, opt PlanOptions) (*Plan, error) {
 		_, err := os.Lstat(filepath.Join(local.Root, filepath.FromSlash(rel)))
 		return os.IsNotExist(err)
 	}
-	scan, err := ScanCloud(r, root, opt.Limits)
-	if err != nil {
-		return nil, err
-	}
+	return limits
+}
+
+func assemblePlan(local *LocalScanResult, scan *CloudScan, opt PlanOptions, hashes map[string]hashResult) *Plan {
+	root := NormalizeRemoteRoot(opt.RemoteRoot)
 	plan := &Plan{GeneratedAt: opt.Now.Format(time.RFC3339), LocalRoot: local.Root, RemoteRoot: root,
 		LocalFiles: local.Stats.FileCount, LocalDirs: local.Stats.DirCount, LocalBytes: local.Stats.TotalBytes,
 		CloudFiles: scan.Stats.FileCount, CloudDirs: scan.Stats.DirCount, CloudBytes: scan.Stats.TotalBytes,
 		cloudSnapshot: scan.Entries, StructuralDigest: scan.StructuralDigest(),
-		ScanComplete: scan.ScanComplete() && !scan.ShortOfRequestedDepth(), LocalScanComplete: !local.Stats.Truncated,
+		ScanComplete: scan.ScanComplete() && !scan.ShortOfRequestedDepth(), LocalScanComplete: !local.Stats.Truncated && len(local.Errors) == 0,
 		Warnings: append([]string(nil), local.Warnings...)}
+	plan.localSnapshot, plan.cloudScan, plan.planOptions = local, scan, opt
+	plan.ScanIssues = scanIssues(local, scan)
+	plan.PartialScanSafe = len(plan.ScanIssues) > 0 && !local.Stats.Truncated && !scan.Stats.Truncated
+	for _, issue := range plan.ScanIssues {
+		if !validIssueRel(issue.RelPath) {
+			plan.PartialScanSafe = false
+		}
+		plan.Unverified = append(plan.Unverified, PlannedAction{Kind: ActionUnverified, RelPath: issue.RelPath, RemotePath: JoinRemote(root, issue.RelPath), Reason: issue.Side + "读取失败，保护此范围并继续其他项：" + issue.Reason})
+	}
 	plan.Performance.CloudListings = scan.Stats.ListingRequests
 	plan.Performance.PrunedDirs = len(scan.PrunedDirs)
 	if len(scan.PrunedDirs) > 0 {
@@ -311,6 +346,7 @@ func BuildPlan(r Reader, opt PlanOptions) (*Plan, error) {
 	for _, abs := range scan.Order {
 		if seen[abs] || !IsSubPath(root, abs) {
 			plan.ScanComplete = false
+			plan.PartialScanSafe = false
 			plan.ScanErrors = append(plan.ScanErrors, "云端路径重复或越界，扫描不可用于执行")
 		}
 		seen[abs] = true
@@ -318,7 +354,16 @@ func BuildPlan(r Reader, opt PlanOptions) (*Plan, error) {
 	for _, e := range scan.Stats.Errors {
 		plan.ScanErrors = append(plan.ScanErrors, fmt.Sprintf("%s: %s", e.Path, e.Err))
 	}
+	for _, e := range local.Errors {
+		plan.ScanErrors = append(plan.ScanErrors, "本地 "+e.Path+": "+e.Err)
+	}
 	p := &cleanupPlanner{plan: plan, local: local, scan: scan, opt: opt, versions: make(map[string][]RemoteEntry), owners: make(map[string]string), protected: make(map[string]bool), sources: make(map[string]bool), hashes: make(map[string]hashResult), dependencies: make(map[string]PlannedAction)}
+	for _, issue := range plan.ScanIssues {
+		p.protected[JoinRemote(root, issue.RelPath)] = true
+	}
+	for rel, h := range hashes {
+		p.hashes[rel] = h
+	}
 	// Assign each suffix file to its nearest real local name. A real a(1).txt
 	// takes precedence over a.txt and is never treated as its disposable copy.
 	for _, abs := range scan.Order {
@@ -348,6 +393,9 @@ func BuildPlan(r Reader, opt PlanOptions) (*Plan, error) {
 	}
 	p.prepareHashes()
 	for _, rel := range local.Order {
+		if plan.scopeUnverified(rel) {
+			continue
+		}
 		p.classifyLocal(rel, local.Entries[rel])
 	}
 	p.classifyExtras()
@@ -356,8 +404,9 @@ func BuildPlan(r Reader, opt PlanOptions) (*Plan, error) {
 	sortActions(plan.Pending)
 	sortActions(plan.Keeps)
 	sortActions(plan.Conflicts)
+	plan.hashSnapshot = p.hashes
 	opt.Progress.emit(Progress{Phase: "planned", Done: int64(local.Stats.FileCount), Total: int64(local.Stats.FileCount), Files: local.Stats.FileCount, Dirs: local.Stats.DirCount})
-	return plan, nil
+	return plan
 }
 
 type hashResult struct {
@@ -416,7 +465,11 @@ func (p *cleanupPlanner) prepareHashes() {
 	var candidates []LocalEntry
 	for _, rel := range p.local.Order {
 		le := p.local.Entries[rel]
-		if le.IsDir || le.Sparse != "" {
+		if le.IsDir || le.Sparse != "" || p.plan.scopeUnverified(rel) {
+			continue
+		}
+		if old, ok := p.hashes[rel]; ok && old.err == nil && CheckLocalUnchanged(le) == nil {
+			p.plan.Performance.CacheHits++
 			continue
 		}
 		entries := append([]RemoteEntry(nil), p.versions[rel]...)
@@ -575,13 +628,18 @@ func (p *cleanupPlanner) excluded(ce RemoteEntry) bool {
 func (p *cleanupPlanner) classifyExtras() {
 	skipped := 0
 	protectedDirs := make(map[string]bool)
+	for scope := range p.protected {
+		for parent := ParentRemote(scope); parent != p.scan.Root && parent != "/"; parent = ParentRemote(parent) {
+			protectedDirs[parent] = true
+		}
+	}
 	type counts struct {
 		files int
 		bytes int64
 	}
 	totals := make(map[string]counts)
 	for abs, ce := range p.scan.Entries {
-		protected := p.protected[abs] || p.sources[abs] || p.excluded(ce) || p.scan.UnsafeNames[abs] != ""
+		protected := p.plan.scopeUnverified(RelPath(p.scan.Root, abs)) || p.protected[abs] || p.sources[abs] || p.excluded(ce) || p.scan.UnsafeNames[abs] != ""
 		if _, local := p.local.Entries[RelPath(p.scan.Root, abs)]; local {
 			protected = true
 		}
@@ -603,6 +661,9 @@ func (p *cleanupPlanner) classifyExtras() {
 	for _, abs := range paths {
 		ce := p.scan.Entries[abs]
 		rel := RelPath(p.scan.Root, abs)
+		if p.plan.scopeUnverified(rel) {
+			continue
+		}
 		if _, exists := p.local.Entries[rel]; exists {
 			continue
 		}

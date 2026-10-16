@@ -1,6 +1,6 @@
 param(
   [ValidatePattern('^v\d+\.\d+\.\d+(-[a-zA-Z0-9.-]+)?$')]
-  [string]$Version = 'v0.4.1'
+  [string]$Version = 'v0.4.2'
 )
 
 $ErrorActionPreference = 'Stop'

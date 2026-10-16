@@ -35,6 +35,8 @@ type LocalEntry struct {
 
 // LocalScanOptions tunes the local walk.
 type LocalScanOptions struct {
+	readDir  func(string) ([]os.DirEntry, error)
+	lstat    func(string) (os.FileInfo, error)
 	Progress ProgressFunc
 	// SkipNames are file/directory names skipped anywhere in the tree.
 	SkipNames []string
@@ -98,6 +100,7 @@ type LocalScanResult struct {
 	Stats   LocalScanStats
 	// Warnings are non-fatal observations for the operator.
 	Warnings []string
+	Errors   []ScanError // Paths are relative to Root; failed scopes stay protected.
 }
 
 // CloudContentHash is the content hash the reconciler computes for comparison.
@@ -131,6 +134,13 @@ func LocalContentHash(localPath string) (CloudContentHash, error) {
 //   - Only regular files and directories are mirrored. Sockets, devices and
 //     other special files are skipped with a warning.
 func ScanLocal(root string, opt LocalScanOptions) (*LocalScanResult, error) {
+	readDir, lstat := opt.readDir, opt.lstat
+	if readDir == nil {
+		readDir = os.ReadDir
+	}
+	if lstat == nil {
+		lstat = os.Lstat
+	}
 	if strings.TrimSpace(root) == "" {
 		return nil, fmt.Errorf("%w: 本地根目录为空", ErrUsage)
 	}
@@ -173,11 +183,13 @@ func ScanLocal(root string, opt LocalScanOptions) (*LocalScanResult, error) {
 		queue = queue[1:]
 
 		opt.Progress.emit(Progress{Phase: "local", Current: cur.rel, Files: res.Stats.FileCount, Dirs: res.Stats.DirCount, Bytes: res.Stats.TotalBytes})
-		dirEntries, readErr := os.ReadDir(cur.abs)
+		dirEntries, readErr := readDir(cur.abs)
 		if readErr != nil {
-			// An unreadable local directory is fatal: treating it as empty
-			// would mark its entire cloud subtree as redundant.
-			return nil, fmt.Errorf("%w: 读取本地目录失败 %s: %v", ErrUsage, cur.abs, readErr)
+			if cur.rel == "" {
+				return nil, fmt.Errorf("%w: 读取本地目录失败 %s: %v", ErrUsage, cur.abs, readErr)
+			}
+			res.Errors = append(res.Errors, ScanError{Path: cur.rel, Err: readErr.Error()})
+			continue
 		}
 		sort.Slice(dirEntries, func(i, j int) bool { return dirEntries[i].Name() < dirEntries[j].Name() })
 
@@ -209,9 +221,10 @@ func ScanLocal(root string, opt LocalScanOptions) (*LocalScanResult, error) {
 			// errors; cloud paths are built independently from relative paths.
 
 			// Lstat: do not follow links while deciding the type.
-			li, lErr := os.Lstat(childAbs)
+			li, lErr := lstat(childAbs)
 			if lErr != nil {
-				return nil, fmt.Errorf("本地条目无法读取状态，扫描不完整: %s: %w", rel, lErr)
+				res.Errors = append(res.Errors, ScanError{Path: rel, Err: lErr.Error()})
+				continue
 			}
 			isLink := li.Mode()&os.ModeSymlink != 0
 			if isLink {

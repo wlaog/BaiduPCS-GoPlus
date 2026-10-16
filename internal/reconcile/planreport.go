@@ -21,6 +21,10 @@ type PlanReport struct {
 	Renames           []ReportAction  `json:"renames"`
 	Removes           []ReportAction  `json:"removes"`
 	Pending           []ReportAction  `json:"pending"`
+	Unverified        []ReportAction  `json:"unverified"`
+	ScanIssues        []ScanIssue     `json:"scanIssues,omitempty"`
+	PartialScanSafe   bool            `json:"partialScanSafe"`
+	CanRetryScan      bool            `json:"canRetryScan"`
 	Keeps             []ReportAction  `json:"keeps"`
 	Conflicts         []ReportAction  `json:"conflicts"`
 	ScanComplete      bool            `json:"cloudScanComplete"`
@@ -33,11 +37,12 @@ type PlanReport struct {
 	KeptOmitted       int             `json:"keepsOmitted"`
 }
 type PlanCounts struct {
-	Rename   int `json:"rename"`
-	Remove   int `json:"remove"`
-	Pending  int `json:"pending"`
-	Keep     int `json:"keep"`
-	Conflict int `json:"conflict"`
+	Rename     int `json:"rename"`
+	Remove     int `json:"remove"`
+	Pending    int `json:"pending"`
+	Keep       int `json:"keep"`
+	Conflict   int `json:"conflict"`
+	Unverified int `json:"unverified"`
 }
 type PlanSummary struct {
 	Changes             int   `json:"changes"`
@@ -65,7 +70,7 @@ type ReportAction struct {
 	Reason     string `json:"reason"`
 }
 
-const PlanVersion = "0.4.1"
+const PlanVersion = "0.4.2"
 const KeepsShownInReport = 200
 
 func BuildPlanReport(p *Plan, mode string) *PlanReport {
@@ -85,19 +90,25 @@ func BuildPlanReport(p *Plan, mode string) *PlanReport {
 	}
 	r.Summary = PlanSummary{Changes: p.Changes(), RemoveFiles: p.RemoveFiles(), RemoveDirs: dirs, RemoveBytes: p.RemoveBytes(), LocalFiles: p.LocalFiles, LocalDirs: p.LocalDirs, LocalBytes: p.LocalBytes, CloudFiles: p.CloudFiles, CloudDirs: p.CloudDirs, CloudBytes: p.CloudBytes, ZeroDifference: p.ZeroDifference()}
 	r.Summary.UnscannedRemoveDirs = p.UnscannedRemoveDirs()
+	r.Counts.Unverified = len(p.ScanIssues)
+	r.Unverified, r.ScanIssues, r.PartialScanSafe = toReportActions(p.Unverified), p.ScanIssues, p.PartialScanSafe
+	r.CanRetryScan = p.localSnapshot != nil && p.cloudScan != nil && len(p.ScanIssues) > 0 && !p.localSnapshot.Stats.Truncated && !p.cloudScan.Stats.Truncated
 	r.Blockers = collectBlockers(p)
 	return r
 }
 func collectBlockers(p *Plan) []string {
 	var out []string
-	if !p.ScanComplete {
+	if !p.ScanComplete && !p.PartialScanSafe {
 		out = append(out, "云端枚举不完整，禁止执行")
 	}
-	if !p.LocalScanComplete {
+	if !p.LocalScanComplete && !p.PartialScanSafe {
 		out = append(out, "本地扫描不完整，禁止执行")
 	}
 	if p.LocalFiles == 0 && p.LocalDirs == 0 {
 		out = append(out, "本地目录为空，禁止批量清理")
+	}
+	if !p.CanApply() && p.ScanComplete && p.LocalScanComplete {
+		out = append(out, "扫描校验失败，禁止执行")
 	}
 	return out
 }
@@ -126,7 +137,7 @@ func RenderPlanHuman(w io.Writer, r *PlanReport) {
 	if r.Summary.UnscannedRemoveDirs > 0 {
 		fmt.Fprintf(w, "另整目录回收 %d 项及其全部内容（含临时文件）；内部数量与容量未统计，以上文件数仅含已扫描部分\n", r.Summary.UnscannedRemoveDirs)
 	}
-	for _, items := range [][]ReportAction{r.Renames, r.Removes, r.Pending, r.Conflicts} {
+	for _, items := range [][]ReportAction{r.Renames, r.Removes, r.Pending, r.Unverified, r.Conflicts} {
 		for i, a := range items {
 			if i >= 40 {
 				fmt.Fprintln(w, "其余项见 JSON 报告")

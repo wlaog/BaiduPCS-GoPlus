@@ -3,7 +3,7 @@
 #
 #  作用:
 #    1. 把配置目录指向项目内的 .pcsconfig (登录凭据在这里, 否则界面会显示未登录)
-#    2. 打开 reconcile gui, 浏览器会自动弹出
+#    2. 启动 reconcile gui, 只打印地址供手动访问
 #
 #  用法 (任选一种):
 #    右键本文件 -> 使用 PowerShell 运行
@@ -16,7 +16,7 @@
 param(
   [string]$LocalDir  = '',   # 预填本地目录, 例如 D:\WorkSync
   [string]$RemoteDir = '',   # 预填云端目录, 例如 /来自：本地电脑/WorkSync
-  [switch]$NoBrowser         # 不自动打开浏览器, 只打印地址
+  [switch]$NoBrowser         # 兼容参数；始终只打印地址，不自动打开浏览器
 )
 
 $ErrorActionPreference = 'Stop'
@@ -50,15 +50,14 @@ Write-Host '============================================================' -Foreg
 Write-Host "  程序    : $exe"
 Write-Host "  配置目录: $cfg"
 Write-Host ''
-Write-Host '  浏览器会自动打开界面; 若没有, 请手动访问下面打印的地址。'
+Write-Host '  请复制下面打印的完整地址（包含 token）到浏览器中手动打开。'
 Write-Host '  关闭本窗口 (Ctrl+C) 即可结束界面。'
 Write-Host '============================================================' -ForegroundColor Cyan
 Write-Host ''
 
-$guiArgs = @('reconcile', 'gui')
+$guiArgs = @('reconcile', 'gui', '--no-browser')
 if ($LocalDir)  { $guiArgs += @('--local',  $LocalDir) }
 if ($RemoteDir) { $guiArgs += @('--remote', $RemoteDir) }
-if ($NoBrowser) { $guiArgs += '--no-browser' }
 
 try {
   & $exe @guiArgs

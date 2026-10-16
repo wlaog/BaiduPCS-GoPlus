@@ -181,7 +181,7 @@ func TestPlanDoesNotRemoveCloudEntriesMatchingExclusions(t *testing.T) {
 	}
 }
 
-func TestPlanIncompleteScanIsRecordedAsBlocker(t *testing.T) {
+func TestPlanScopedScanFailureAllowsIndependentActions(t *testing.T) {
 	local := t.TempDir()
 	writeLocal(t, local, "a.txt|a", "sub/")
 
@@ -194,14 +194,8 @@ func TestPlanIncompleteScanIsRecordedAsBlocker(t *testing.T) {
 		t.Fatal("a failed subtree must mark the plan's cloud scan incomplete")
 	}
 	rep := BuildPlanReport(plan, "plan")
-	found := false
-	for _, b := range rep.Blockers {
-		if strings.Contains(b, "枚举不完整") {
-			found = true
-		}
-	}
-	if !found {
-		t.Errorf("an incomplete scan must be reported as a blocker, got %v", rep.Blockers)
+	if len(rep.Blockers) != 0 || !plan.CanApply() || len(rep.Unverified) != 1 || !rep.CanRetryScan {
+		t.Fatalf("scoped gap must be protected and retryable without blocking independent actions: %+v", rep)
 	}
 }
 
@@ -317,9 +311,9 @@ func TestPlanUnsafeCloudNameBecomesConflictNotDeletion(t *testing.T) {
 
 // The most dangerous failure mode in this whole feature: if the session expires
 // while enumerating, the directories that could not be read must NOT look like
-// "the user deleted them". Without a hard abort, a mirror would schedule the
-// entire unread remainder of the account for removal.
-func TestPlanAbortsOnAuthExpiryInsteadOfSchedulingRemovals(t *testing.T) {
+// "the user deleted them". Scope isolation must preserve unread content while
+// retaining comparisons for independent branches.
+func TestPlanRetainsVerifiedScopesOnSubtreeAuthFailure(t *testing.T) {
 	local := t.TempDir()
 	writeLocal(t, local, "only-local.txt|x", "a/")
 
@@ -334,23 +328,16 @@ func TestPlanAbortsOnAuthExpiryInsteadOfSchedulingRemovals(t *testing.T) {
 		ErrType: 2, Code: -6, Msg: "请重新登录",
 	}
 
-	_, err := BuildPlan(fs, PlanOptions{
+	plan, err := BuildPlan(fs, PlanOptions{
 		LocalRoot: local, RemoteRoot: "/root", EditingWindow: -1,
 	})
-	if err == nil {
-		t.Fatal("an expired session must abort plan generation, not produce a plan")
-	}
-	if !IsAuthExpired(err) {
-		t.Fatalf("expected an AuthExpiredError, got %T: %v", err, err)
-	}
-	// The message must tell the operator what to do.
-	if !strings.Contains(err.Error(), "重新登录") {
-		t.Errorf("error should tell the operator to log in again, got %q", err.Error())
+	if err != nil || plan.ScanComplete || len(plan.ScanIssues) != 1 || hasRel(plan.Removes, "a") || !hasRel(plan.Removes, "b") {
+		t.Fatal("unread branch must stay protected while independent results survive")
 	}
 }
 
 // A non-auth listing failure must still allow a plan (marked incomplete and
-// blocked), but it must never turn unread cloud content into removals.
+// protected), but it must never turn unread cloud content into removals.
 func TestPlanIgnoresWindowsSystemArtifactsOnBothSides(t *testing.T) {
 	local := t.TempDir()
 	writeLocal(t, local, "keep.txt|keep", "desktop.ini|settings", "sub/", "sub/Thumbs.db|thumbs")

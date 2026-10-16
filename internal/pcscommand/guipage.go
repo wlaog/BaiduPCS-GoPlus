@@ -211,6 +211,7 @@ dialog::backdrop{background:#18223066} .picker-head,.picker-foot{padding:18px 22
   </details>
   <div class="actions">
     <button class="primary" id="btnPlan">预览差异</button>
+    <button id="btnRetryScan" class="hidden">仅补扫失败范围</button>
   </div>
   <div id="planOut" class="hidden" style="margin-top:14px"></div>
 </div>
@@ -319,6 +320,7 @@ function invalidatePlan(){
   document.getElementById("applyBlocked").classList.remove("hidden");
   document.getElementById("applyBlocked").textContent = "目录或比较选项已改变，请重新预览差异。";
   document.getElementById("planOut").classList.add("hidden");
+  document.getElementById("btnRetryScan").classList.add("hidden");
   document.getElementById("applyOut").classList.add("hidden");
   document.getElementById("confirmRemoval").checked = false;
   document.getElementById("ackBlast").checked = false;
@@ -487,11 +489,13 @@ function renderPlan(r, savedTo){
     +"<div><b class='k-REMOVE'>"+r.counts.remove+"</b>REMOVE 多余项</div>"
     +"<div><b class='k-KEEP'>"+r.counts.keep+"</b>KEEP 已一致</div>"
     +"<div><b class='k-WAIT'>"+r.counts.pending+"</b>WAIT 等待备份</div>"
+    +"<div><b>"+(r.counts.unverified||0)+"</b>未核实范围</div>"
     +"<div><b class='k-CONFLICT'>"+r.counts.conflict+"</b>跳过 / 需判断</div></div>";
   h+="<div class='hint'>本地 "+r.summary.localFiles+" 文件 / 云端已扫描 "+r.summary.cloudFiles
     +" 文件；拟回收已统计文件 "+r.summary.removeFiles+" 个（含重命名前同名旧版），共 "+size(r.summary.removeBytes)+"。</div>";
   if(r.summary.unscannedRemoveDirs)h+="<div class='banner warn'>另有 "+r.summary.unscannedRemoveDirs+" 个目录整棵回收（包含全部内容和内部临时文件）；未向下扫描，内部文件数量与容量不计入上述统计。</div>";
   if(r.performance)h+="<div class='hint'>内容读取 "+size(r.performance.hashBytes)+"；复用 "+r.performance.cacheHits+" 个哈希缓存；云端目录请求 "+r.performance.cloudListings+" 次。</div>";
+  if(r.scanIssues?.length)h+="<div class='banner warn'>读取失败的范围及其父目录已保护，不计入 WAIT。其他已确认项可继续整理；可仅补扫失败范围，复用本次成功结果。</div>";
   function section(title,note,items){
     if(!items?.length)return "";
     let s="<h3 style='font-size:14px;margin-top:14px'>"+title+" ("+items.length+")</h3><div class='hint'>"+note+"</div>";
@@ -507,10 +511,12 @@ function renderPlan(r, savedTo){
   h+=section("RENAME 重命名为本地名称","已按内容确认版本；存在同名旧版时，先移入回收站。",r.renames);
   h+=section("REMOVE 云端多余项","本地不存在的最外层目录直接整棵回收；单项失败跳过，其他独立项继续。",r.removes);
   h+=section("WAIT 等待官方备份","尚未找到本地最新内容，保留相关历史版本。",r.pending);
+  h+=section("UNVERIFIED 未核实并跳过","读取失败的文件或目录已保护；相关范围及包含它的父目录均不会被整理。",r.unverified);
   h+=section("跳过 / 需要判断","只跳过相关文件，不阻止其他独立项。",r.conflicts);
   if(r.blockers?.length)h+='<div class="banner warn"><b>无法执行：</b>'+r.blockers.map(esc).join("；")+'</div>';
   if(savedTo)h+='<div class="hint">报告已保存：'+esc(savedTo)+'</div>';
   show("planOut",h);
+  document.getElementById("btnRetryScan").classList.toggle("hidden",!r.canRetryScan);
   const actionable=r.summary.changes>0&&!r.blockers?.length;
   document.getElementById("applyReady").classList.toggle("hidden",!actionable);
   const blocked=document.getElementById("applyBlocked");blocked.classList.toggle("hidden",actionable);
@@ -525,6 +531,19 @@ document.getElementById("btnPlan").onclick=async(ev)=>{
     const j=await post("/api/plan",{localDir:document.getElementById("localDir").value.trim(),remoteRoot:document.getElementById("remoteRoot").value.trim(),hashFiles:document.getElementById("hashFiles").checked});
     if(epoch!==planEpoch)return;
     if(!j.ok){show("planOut",'<div class="banner warn">'+esc(j.error)+'</div>');return;}
+    renderPlan(j.report,j.savedTo);
+  }finally{busy(btn,false);updateCleanupOptions();}
+};
+
+document.getElementById("btnRetryScan").onclick=async(ev)=>{
+  if(!currentPlan?.canRetryScan)return;
+  const btn=ev.target;busy(btn,true,"补扫中…");
+  try{
+    const j=await post("/api/rescan",{});
+    if(!j.ok){show("applyOut",'<div class="banner warn">'+esc(j.error)+'</div>');return;}
+    document.getElementById("confirmRemoval").checked=false;
+    document.getElementById("ackBlast").checked=false;
+    document.getElementById("btnApply").textContent="执行整理";
     renderPlan(j.report,j.savedTo);
   }finally{busy(btn,false);updateCleanupOptions();}
 };
@@ -546,7 +565,7 @@ document.getElementById("btnApply").onclick=async(ev)=>{
     let h="<div class='tally'><div><b>"+renames.filter(x=>x.OK).length+"</b>重命名成功</div>"
       +"<div><b>"+(removes.filter(x=>x.OK).length+renames.filter(x=>x.TargetRemoved).length)+"</b>清理成功（项）</div>"
       +"<div><b>"+r.failures+"</b>未完成 / 跳过</div></div>";
-    h+="<div class='hint'>"+esc(r.startedAt)+" → "+esc(r.finishedAt)+"；等待官方备份 "+r.pendingCount+" 项。</div>";
+    h+="<div class='hint'>"+esc(r.startedAt)+" → "+esc(r.finishedAt)+"；等待官方备份 "+r.pendingCount+" 项；未核实范围 "+(r.unverifiedCount||0)+" 项，已保护。</div>";
     if(r.removalSkipped)h+='<div class="banner warn">'+esc(r.removalReason)+'</div>';
     if(r.aborted)h+='<div class="banner warn">'+esc(r.abortReason)+'</div>';
     const problems=[...renames,...removes].filter(x=>!x.OK);
@@ -554,7 +573,7 @@ document.getElementById("btnApply").onclick=async(ev)=>{
     if(r.recoverySteps?.length)h+="<div class='hint'>"+r.recoverySteps.map(esc).join("<br>")+"</div>";
     if(j.remainingReport){
       renderPlan(j.remainingReport);
-      h+='<div class="banner warn">其他独立项已处理。现在可仅重试未完成项，无需重新全盘扫描；重试前仍会逐项复核。</div>';
+      h+='<div class="banner warn">其他独立项已处理。剩余操作可单独重试，未核实范围可单独补扫，无需重新全盘扫描。</div>';
     }else{
       h+='<div class="banner">本次可执行项已完成。等待备份和需判断项仍保留；不会上传或创建目录。</div>';
       document.getElementById("applyReady").classList.add("hidden");

@@ -1407,7 +1407,7 @@ func main() {
 					Name:        "apply",
 					Usage:       "执行对齐 (会修改云端; 默认先预览并要求确认)",
 					UsageText:   app.Name + " reconcile apply --local <本地目录> --remote <云端目录> [--remove-mode recycle]",
-					Description: `只执行云端重命名和回收站删除，不上传、不创建目录。按内容匹配版本后再整理历史副本；找不到本地最新内容时等待官方备份。单项失败会记录并继续处理其他独立项，关联正确版本尚未就位时保留其历史副本。扫描不完整、空本地目录及未确认的大批量清理仍会阻止执行。GUI 可保持服务运行，仅重试未完成项而无需重新全盘扫描。`,
+					Description: `只执行云端重命名和回收站删除，不上传、不创建目录。按内容匹配版本后再整理历史副本；找不到本地最新内容时等待官方备份。单项失败会记录并继续处理其他独立项，关联正确版本尚未就位时保留其历史副本。读取失败只保护未核实范围，其他独立项仍可执行。根目录不可验证、全局安全上限、空本地目录及未确认的大批量清理仍会阻止执行。GUI 保持服务运行可仅补扫失败范围，或重试未完成操作，无需重新全盘扫描。`,
 					Category:    "百度网盘",
 					Before:      reloadFn,
 					Action: func(c *cli.Context) error {
@@ -1501,21 +1501,22 @@ func main() {
 				{
 					Name:      "gui",
 					Usage:     "打开本地图形界面 (只监听本机)",
-					UsageText: app.Name + " reconcile gui [--local <本地目录>] [--remote <云端目录>] [--no-browser]",
+					UsageText: app.Name + " reconcile gui [--local <本地目录>] [--remote <云端目录>]",
 					Description: `
 	启动一个只在本机可用的图形界面, 用于完成"对齐本地"的三个步骤:
 
 	  1. 只读探测:  找出云端备份目录, 核对本地与云端
-	  2. 预览差异:  UPLOAD / REPLACE / MKDIR / REMOVE / KEEP / CONFLICT
+	  2. 预览差异:  RENAME / REMOVE / KEEP / WAIT / UNVERIFIED / CONFLICT
 	  3. 执行对齐:  仅删除云端多余项或重命名正确版本；失败项可单独重试
 
 	界面内已内置完整的操作步骤说明与安全设计说明。
+	启动后只打印本机访问地址，请复制完整地址到浏览器手动打开。
 
 	安全性:
 	  * 只监听 127.0.0.1 (本机回环), 拒绝绑定其它地址
 	  * 每次启动生成随机令牌, 所有请求都必须携带
 	  * 图形界面只是 reconcile 命令的另一种入口, 比对与安全逻辑完全共用,
-	    因此界面不会绕过确认、阈值或"扫描不完整即拒绝执行"等保护
+	    因此界面不会绕过确认、阈值或未核实范围保护
 	  * 不会修改本地文件, 不会替代或修改官方网盘客户端
 
 	按 Ctrl+C 或界面上的"关闭界面"结束。关闭界面不影响网盘内容。
@@ -1528,10 +1529,9 @@ func main() {
 					Before:   reloadFn,
 					Action: func(c *cli.Context) error {
 						if err := pcscommand.RunReconcileGui(&pcscommand.GuiOptions{
-							Addr:        c.String("addr"),
-							OpenBrowser: !c.Bool("no-browser"),
-							LocalDir:    c.String("local"),
-							RemoteRoot:  c.String("remote"),
+							Addr:       c.String("addr"),
+							LocalDir:   c.String("local"),
+							RemoteRoot: c.String("remote"),
 						}); err != nil {
 							return cli.NewExitError(err.Error(), 1)
 						}
@@ -1551,8 +1551,9 @@ func main() {
 							Usage: "监听地址 (仅允许本机地址, 默认自动选择端口)",
 						},
 						cli.BoolFlag{
-							Name:  "no-browser",
-							Usage: "不自动打开浏览器, 只打印地址",
+							Name:   "no-browser",
+							Hidden: true,
+							Usage:  "兼容选项：界面始终只打印地址，由用户手动访问",
 						},
 					},
 				},

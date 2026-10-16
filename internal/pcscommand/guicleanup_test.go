@@ -37,3 +37,14 @@ func TestGuiKeepsOnlyFailedActionsForRetryAndPageReload(t *testing.T) {
 		t.Fatal("completed actions must not remain retryable")
 	}
 }
+
+func TestGuiRetainsScanGapsAfterAllExecutableItemsComplete(t *testing.T) {
+	s := &GuiSession{}
+	a := reconcile.PlannedAction{Kind: reconcile.ActionRemove, RelPath: "old.txt", RemotePath: "/backup/old.txt"}
+	p := &reconcile.Plan{LocalRoot: t.TempDir(), RemoteRoot: "/backup", LocalFiles: 1, LocalScanComplete: true, PartialScanSafe: true, ScanIssues: []reconcile.ScanIssue{{Side: "云端", RelPath: "bad", Reason: "600"}}, Removes: []reconcile.PlannedAction{a}}
+	report := &reconcile.ApplyReport{Removes: []reconcile.ApplyResult{{Action: a, OK: true}}}
+	preview := s.finishApply(p, report)
+	if preview == nil || preview.Summary.Changes != 0 || len(preview.ScanIssues) != 1 || s.progress.Status != "warning" {
+		t.Fatal("completed operations must preserve unresolved scan scopes and show a warning")
+	}
+}

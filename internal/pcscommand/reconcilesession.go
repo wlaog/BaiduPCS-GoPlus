@@ -137,6 +137,9 @@ func (s *ReconcileSession) Plan(opt ReconcilePlanOptions) (*reconcile.PlanReport
 		s.log("哈希缓存保存失败，下次将重新计算")
 	}
 	s.log(fmt.Sprintf("扫描完成, 用时 %s", time.Since(started).Round(time.Second)))
+	for _, issue := range plan.ScanIssues {
+		s.log(fmt.Sprintf("跳过未核实范围 [%s] %s: %s；其他项继续", issue.Side, issue.RelPath, issue.Reason))
+	}
 	s.log(fmt.Sprintf("本次内容读取 %d 字节，复用 %d 个哈希缓存，云端目录请求 %d 次；待重命名 %d，待清理 %d，等待官方备份 %d", plan.Performance.HashBytes, plan.Performance.CacheHits, plan.Performance.CloudListings, len(plan.Renames), len(plan.Removes), len(plan.Pending)))
 	return reconcile.BuildPlanReport(plan, "plan (只读预览)"), plan, nil
 }
@@ -168,7 +171,7 @@ func (s *ReconcileSession) Apply(opt ApplyOptions) (*reconcile.ApplyReport, erro
 	if opt.Plan == nil {
 		return nil, errors.New("缺少差异计划: 请先执行「预览差异」")
 	}
-	if !opt.Plan.ScanComplete || !opt.Plan.LocalScanComplete {
+	if !opt.Plan.CanApply() {
 		return nil, errors.New("扫描不完整, 已拒绝执行 (不会做任何改动)。请重新预览差异后再试")
 	}
 
@@ -203,6 +206,17 @@ func (s *ReconcileSession) Apply(opt ApplyOptions) (*reconcile.ApplyReport, erro
 		MaxRemoveBytes:     opt.MaxRemoveBytes,
 		AcknowledgeBlast:   opt.AcknowledgeBlast,
 	})
+}
+
+// RetryScan reuses the live service's successful scan scopes.
+func (s *ReconcileSession) RetryScan(plan *reconcile.Plan) (*reconcile.Plan, error) {
+	if _, err := ensureLogin(); err != nil {
+		return nil, err
+	}
+	fs := reconcile.NewRemoteFS(GetBaiduPCS())
+	fs.Log = s.log
+	s.log("仅补扫失败范围；保留成功扫描与已完成操作")
+	return reconcile.RetryFailedScan(fs, plan, s.Progress)
 }
 
 // SaveReconcileReport persists a JSON payload under the report directory and
